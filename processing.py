@@ -1,31 +1,43 @@
+import datetime
+import pickle as pkl
 from lib_phmm.config import CONFIG
 from lib_phmm.model import *
 from lib_phmm.signals import *
 from lib_phmm.phmm_utils import *
 from lib_phmm.visualization import *
+from pathlib import Path
+
 
 if __name__ == "__main__":
+    dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     path = '../audio/aggression'
-
+    output_path = f'{path}/output_{dt}'
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    
     print(CONFIG)
     model     = whisper_model_v2()
     processor = whisper_processor()
 
     files = [f'{path}/{file}' for file in os.listdir(path) if file.endswith('.wav')]
     embeddings = [load_file(file) for file in files]
-
-    MAX_MATCH  = 25
-    MAX_STATES = 128
-    MIN_STATES = 6
+    with open(f"{output_path}/embeddings.pkl", "wb") as f:
+        pkl.dump(embeddings, f)
+    
+    
+    MAX_MATCH  = 5
+    MAX_STATES = 32
+    MIN_STATES = 8
 
     D = len(embeddings[0][0][0])
     n_frames_total = sum(len(embedding) for _, embedding, _ in embeddings)
 
-    nested_results = Parallel(n_jobs=-1, backend="loky")(
+    nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
         delayed(sweep_one_state_count)(n_match_states, embeddings, MAX_MATCH, D, n_frames_total)
         for n_match_states in range(MIN_STATES, MAX_STATES)
     )
     results = [r for sublist in nested_results for r in sublist]
+    with open(f"{output_path}/results.pkl", "wb") as f:
+        pkl.dump(results, f)
 
     best = min(results, key=lambda r: r["bic"])
     hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"])
@@ -40,8 +52,8 @@ if __name__ == "__main__":
         waveform, sr           = load_filtered_waveform(files[i])
         gapped, segments, _    = extract_match_wav(paths[i], waveform, n_models, n_states)
         all_segments[i]        = segments
-        torchaudio.save(f'aligned_{i}.wav', gapped, sr)
+        torchaudio.save(f'{output_path}/aligned_{i}.wav', gapped, sr)
 
     fig, axes = plot_aligned_spectrograms(list(range(len(files))), files, paths, n_states, n_models)
-    plt.savefig('aligned_plots.png')
+    plt.savefig(f'{output_path}/aligned_plots.png')
     plt.show()
