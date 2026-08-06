@@ -6,6 +6,7 @@ from lib_phmm.model import *
 from lib_phmm.signals import *
 from lib_phmm.phmm_utils import *
 from lib_phmm.visualization import *
+from lib_phmm.metrics import *
 from pathlib import Path
 
 
@@ -26,28 +27,49 @@ if __name__ == "__main__":
     print("==========================================")
     print(f"Config: {CONFIG}")
     print("==========================================")
-    
-    model     = whisper_model_v2()
-    processor = whisper_processor()
+
+    embeddings_path = f'{path}/embeddings.pkl'
+    results_path    = f'{path}/results.pkl'
+
+    files = [f'{path}/{file}' for file in os.listdir(path) if file.endswith('.wav')]
 
     print("Embedddings")
-    files = [f'{path}/{file}' for file in os.listdir(path) if file.endswith('.wav')]
-    embeddings = [load_file(file, model, processor) for file in files]
-    with open(f"{output_path}/embeddings.pkl", "wb") as f:
-        pkl.dump(embeddings, f)
+    embeddings = None
+    if os.path.exists(embeddings_path):
+        with open(embeddings_path, "rb") as f:
+            embeddings = pkl.load(f)
+        if len(embeddings) != len(files):
+            print(f"Cached embeddings ({len(embeddings)}) don't match {len(files)} wav files found -- recomputing")
+            embeddings = None
+        else:
+            print(f"Loaded cached embeddings from: {embeddings_path}")
+
+    if embeddings is None:
+        model     = whisper_model_v2()
+        processor = whisper_processor()
+        embeddings = [load_file(file, model, processor) for file in files]
+        with open(embeddings_path, "wb") as f:
+            pkl.dump(embeddings, f)
     print("==========================================")
 
     print("Parameter Sweep HMM")
-    D = len(embeddings[0][0][0])
-    n_frames_total = sum(len(embedding) for _, embedding, _ in embeddings)    
-    nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
-        delayed(sweep_one_state_count)(n_match_states, embeddings, MAX_MATCH, D, n_frames_total)
-        for n_match_states in range(MIN_STATES, MAX_STATES)
-    )
-    results = [r for sublist in nested_results for r in sublist]
-    with open(f"{output_path}/results.pkl", "wb") as f:
-        pkl.dump(results, f)
-    
+    results = None
+    if os.path.exists(results_path):
+        with open(results_path, "rb") as f:
+            results = pkl.load(f)
+        print(f"Loaded cached sweep results from: {results_path}")
+
+    if results is None:
+        D = len(embeddings[0][0][0])
+        n_frames_total = sum(len(embedding) for _, embedding, _ in embeddings)
+        nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
+            delayed(sweep_one_state_count)(n_match_states, embeddings, MAX_MATCH, D, n_frames_total)
+            for n_match_states in range(MIN_STATES, MAX_STATES)
+        )
+        results = [r for sublist in nested_results for r in sublist]
+        with open(results_path, "wb") as f:
+            pkl.dump(results, f)
+
     best = min(results, key=lambda r: r["bic"])
     hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"])
     scores_norm, paths, raw_scores = decode_all(embeddings, hmm)
@@ -58,6 +80,22 @@ if __name__ == "__main__":
     n_models = len(hmm.pdf)
 
     print("==========================================")
+    print("Alignment Quality Metrics")
+    msa = build_msa_from_paths(embeddings, paths, n_models, n_states)
+    metrics = compute_all_metrics(msa, len(embeddings))
+    metrics_df = metrics_to_dataframe(metrics)
+    metrics_df.insert(0, 'run', dt)
+    metrics_df.insert(1, 'n_sequences', len(embeddings))
+    metrics_df.insert(2, 'n_match_states', best['n_match_states'])
+    metrics_df.insert(3, 'n_sub_models', best['n_sub_models'])
+    metrics_df.insert(4, 'bic', best['bic'])
+    metrics_df.insert(5, 'mean_fit', total_fit / len(embeddings))
+    metrics_df.insert(6, 'well_fit_count', len(well_fits))
+    metrics_df.insert(7, 'well_fit_rate', len(well_fits) / len(embeddings) * 100)
+    metrics_df.to_csv(f'{output_path}/metrics.csv', index=False)
+    print(metrics_df.to_string(index=False))
+    print("==========================================")
+
     print("Plot results")
     all_segments = {}
     for i in range(0, len(files)):
