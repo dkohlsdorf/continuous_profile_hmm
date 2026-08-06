@@ -1,30 +1,12 @@
 import numpy as np
 import lib_phmm.profile_hmm as phmm
 
-
 DEFAULT_JJ = 0.01
 DEFAULT_JB = 1.0 - DEFAULT_JJ
 
 
 def _smoothed(self_ct, exit_ct, alpha):
     return (self_ct + alpha) / (self_ct + exit_ct + 2 * alpha)
-
-
-def load_file(filename, model, processor):
-    print(f"... {filename}")
-    waveform, _ = load_filtered_waveform(filename)
-    results     = [result for result in process(waveform, model, processor)]    
-    
-    embeddings = [r['embeddings'] for r in results]
-    embeddings = np.array(embeddings)
-    embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
-    
-    classifications = [classify(r['classifications']) for r in results]
-    annotated       = [x for x in zip(classifications, embeddings)]
-    
-    sequence   = [a[1] for a in annotated if a[0] != 'NOISE']
-        
-    return sequence, embeddings, classifications
 
 
 def estimate_transitions(alignments, n_match_states,

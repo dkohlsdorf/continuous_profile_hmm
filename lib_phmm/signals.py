@@ -5,6 +5,23 @@ import torchaudio
 from lib_phmm.config import CONFIG
 
 
+def load_file(filename, model, processor):
+    print(f"... {filename}")
+    waveform, _ = load_filtered_waveform(filename)
+    results     = [result for result in process(waveform, model, processor)]    
+    
+    embeddings = [r['embeddings'] for r in results]
+    embeddings = np.array(embeddings)
+    embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
+    
+    classifications = [classify(r['classifications']) for r in results]
+    annotated       = [x for x in zip(classifications, embeddings)]
+    
+    sequence   = [a[1] for a in annotated if a[0] != 'NOISE']
+        
+    return sequence, embeddings, classifications
+
+
 def load_filtered_waveform(filename):
     waveform, sr = torchaudio.load(filename)
     waveform = torchaudio.functional.highpass_biquad(
@@ -14,7 +31,6 @@ def load_filtered_waveform(filename):
         waveform, sr, CONFIG['max_frequency_hz']
     )
     return waveform, sr
-
 
 
 def process(waveform, model, processor):
