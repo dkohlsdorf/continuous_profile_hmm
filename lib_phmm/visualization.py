@@ -1,8 +1,9 @@
 import torch
-import torchaudio
 import matplotlib.pyplot as plt
+import lib_phmm.profile_hmm as phmm
 
 from lib_phmm.config import CONFIG
+from lib_phmm.signals import *
 
 
 def extract_match_wav(path, waveform, n_models, n_states, frames_per_column=2,

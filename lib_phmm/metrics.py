@@ -221,15 +221,6 @@ def compute_all_metrics(msa, n_sequences):
     }
 
 
-def alignment_metrics(embeddings, paths, n_models, n_states):
-    """
-    Convenience wrapper: build the MSA column structure from Viterbi paths
-    and score it in one call.
-    """
-    msa = build_msa_from_paths(embeddings, paths, n_models, n_states)
-    return compute_all_metrics(msa, len(embeddings))
-
-
 def metrics_to_dataframe(metrics):
     """
     Flatten compute_all_metrics()'s output into a one-row DataFrame, using

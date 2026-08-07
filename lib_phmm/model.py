@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import AutoModel, AutoFeatureExtractor, WhisperModel, WhisperProcessor
-from peft import get_peft_model, LoraConfig, TaskType
+from transformers import WhisperModel, WhisperProcessor
+from peft import get_peft_model, LoraConfig
 from lib_phmm.config import CONFIG
 
 
@@ -140,13 +140,3 @@ def base_model(model_size=None, model_id=None):
 def lora_encoder(model_size=None):
     return get_peft_model(base_model(model_size).encoder, lora_config())
 
-
-def raw(path):
-    try:
-        fs, x = read(path)
-        if len(x.shape) > 1:
-            return fs, x[:, 0]
-        return fs, x
-    except:
-        print("Could not read file: {}".format(path))
-        return 0, np.zeros(0)

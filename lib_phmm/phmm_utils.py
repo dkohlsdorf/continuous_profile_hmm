@@ -1,5 +1,7 @@
 import numpy as np
 import lib_phmm.profile_hmm as phmm
+from lib_phmm.compression import *
+
 
 DEFAULT_JJ = 0.01
 DEFAULT_JB = 1.0 - DEFAULT_JJ

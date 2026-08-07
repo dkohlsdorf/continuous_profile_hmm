@@ -7,7 +7,9 @@ from lib_phmm.signals import *
 from lib_phmm.phmm_utils import *
 from lib_phmm.visualization import *
 from lib_phmm.metrics import *
+
 from pathlib import Path
+from joblib import Parallel, delayed
 
 
 MAX_MATCH  = 5
@@ -18,7 +20,7 @@ MIN_STATES = 8
 if __name__ == "__main__":
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     path = '../audio/aggression'
-    output_path = f'{path}/output_{dt}'
+    output_path = f'{path}/output'
     Path(output_path).mkdir(parents=True, exist_ok=True)
 
     print("==========================================")
@@ -28,8 +30,8 @@ if __name__ == "__main__":
     print(f"Config: {CONFIG}")
     print("==========================================")
 
-    embeddings_path = f'{path}/embeddings.pkl'
-    results_path    = f'{path}/results.pkl'
+    embeddings_path = f'{output_path}/embeddings.pkl'
+    results_path    = f'{output_path}/results.pkl'
 
     files = [f'{path}/{file}' for file in os.listdir(path) if file.endswith('.wav')]
 

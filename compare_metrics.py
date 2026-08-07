@@ -29,12 +29,6 @@ HIGHER_IS_BETTER = [
     'mean_fit', 'well_fit_rate', 'percentage_clean',
 ]
 
-# informational only -- no "better" direction
-NEUTRAL_METRICS = [
-    'n_sequences', 'n_match_states', 'n_sub_models', 'well_fit_count',
-    'total_columns', 'min_gap_pct', 'total_gap_positions', 'total_positions',
-]
-
 KEY_METRICS = [
     'bic', 'mean_fit', 'well_fit_count', 'well_fit_rate',
     'n_match_states', 'n_sub_models',

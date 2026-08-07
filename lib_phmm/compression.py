@@ -1,4 +1,5 @@
 import numpy as np
+import heapq
 
 
 def euc(x, y):
