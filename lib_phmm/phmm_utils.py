@@ -1,4 +1,5 @@
 import numpy as np
+import itertools
 import lib_phmm.profile_hmm as phmm
 from lib_phmm.compression import *
 

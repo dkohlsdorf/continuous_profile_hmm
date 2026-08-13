@@ -1,4 +1,5 @@
 import os
+import argparse
 import datetime
 import pickle as pkl
 from lib_phmm.config import CONFIG
@@ -18,9 +19,15 @@ MIN_STATES = 8
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--motif-mode", action="store_true", help="split each file into bounded motif regions instead of one whole-file sequence")
+    parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
+    parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
+    args = parser.parse_args()
+
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    path = '../audio/aggression'
-    output_path = f'{path}/output'
+    path = args.path
+    output_path = args.output_path if args.output_path is not None else f'{path}/output'
     Path(output_path).mkdir(parents=True, exist_ok=True)
 
     print("==========================================")
@@ -47,12 +54,19 @@ if __name__ == "__main__":
             print(f"Loaded cached embeddings from: {embeddings_path}")
 
     if embeddings is None:
-        model     = whisper_model_v2()
-        processor = whisper_processor()
-        embeddings = [load_file(file, model, processor) for file in files]
+        model      = whisper_model_v2()
+        processor  = whisper_processor()
+        embeddings = []
+        for file in files:
+            embeddings.append(load_file(file, model, processor, motif_mode=args.motif_mode))
         with open(embeddings_path, "wb") as f:
             pkl.dump(embeddings, f)
     print("==========================================")
+
+    candidates = []
+    for sequence, full_embedding, _ in embeddings:
+        for region_classifications, region_embeddings in sequence:
+            candidates.append((region_embeddings, full_embedding, region_classifications))
 
     print("Parameter Sweep HMM")
     results = None
@@ -62,10 +76,10 @@ if __name__ == "__main__":
         print(f"Loaded cached sweep results from: {results_path}")
 
     if results is None:
-        D = len(embeddings[0][0][0])
+        D = embeddings[0][1].shape[1]
         n_frames_total = sum(len(embedding) for _, embedding, _ in embeddings)
         nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
-            delayed(sweep_one_state_count)(n_match_states, embeddings, MAX_MATCH, D, n_frames_total)
+            delayed(sweep_one_state_count)(n_match_states, candidates, MAX_MATCH, D, n_frames_total)
             for n_match_states in range(MIN_STATES, MAX_STATES)
         )
         results = [r for sublist in nested_results for r in sublist]

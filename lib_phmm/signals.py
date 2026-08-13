@@ -5,7 +5,28 @@ import torchaudio
 from lib_phmm.config import CONFIG
 
 
-def load_file(filename, model, processor):
+def bounded_regions(annotated, min_size=10):
+    recording = False
+    current_classifications = []
+    current_embeddings = []
+    regions = []
+    for classification, embedding in annotated:
+        if recording and classification == 'NOISE':
+            recording = False
+            if len(current_embeddings) >= min_size:
+                regions.append((current_classifications, current_embeddings))
+            current_classifications = []
+            current_embeddings = []
+        if classification != 'NOISE':
+            recording = True
+            current_classifications.append(classification)
+            current_embeddings.append(embedding)
+    if len(current_embeddings) >= min_size:
+        regions.append((current_classifications, current_embeddings))
+    return regions
+
+
+def load_file(filename, model, processor, motif_mode=False):
     print(f"... {filename}")
     waveform, _ = load_filtered_waveform(filename)
     results     = [result for result in process(waveform, model, processor)]    
@@ -16,10 +37,13 @@ def load_file(filename, model, processor):
     
     classifications = [classify(r['classifications']) for r in results]
     annotated       = [x for x in zip(classifications, embeddings)]
-    
-    sequence   = [a[1] for a in annotated if a[0] != 'NOISE']
-        
-    return sequence, embeddings, classifications
+
+    if motif_mode:
+        sequences = bounded_regions(annotated)
+    else:
+        non_noise = [a for a in annotated if a[0] != 'NOISE']
+        sequences = [([a[0] for a in non_noise], [a[1] for a in non_noise])]
+    return sequences, embeddings, classifications
 
 
 def load_filtered_waveform(filename):
@@ -62,10 +86,10 @@ def process(waveform, model, processor):
 
 
 LABEL_MAP = {
-    1: 'DOWN',
-    2: 'UP',
-    3: 'BURST',
-    4: 'ECHO',
+    2: 'DOWN',
+    1: 'UP',
+    4: 'BURST',
+    3: 'ECHO',
     0: 'NOISE'
 }
 
