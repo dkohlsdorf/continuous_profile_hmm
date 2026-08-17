@@ -15,15 +15,22 @@ from joblib import Parallel, delayed
 
 MAX_MATCH  = 5
 MAX_STATES = 32
-MIN_STATES = 8
+MIN_STATES = 3
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--motif-mode", action="store_true", help="split each file into bounded motif regions instead of one whole-file sequence")
+    parser.add_argument("--motif-mode-filtered", action="store_true", help="like --motif-mode, but first cluster candidate regions by DTW distance (hierarchical k-medoids) and only pass the resulting medoids into the HMM sweep")
+    parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance, used by --motif-mode-filtered")
+    parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split, used by --motif-mode-filtered")
+    parser.add_argument("--dtw-threshold", type=float, default=None, help="stop splitting a branch once its average intra-cluster DTW distance drops below this -- required with --motif-mode-filtered, since a bad default silently over- or under-splits")
     parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
     parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
     args = parser.parse_args()
+
+    if args.motif_mode_filtered and args.dtw_threshold is None:
+        parser.error("--motif-mode-filtered requires --dtw-threshold (no safe default -- depends on your embedding scale)")
 
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     path = args.path
@@ -58,7 +65,7 @@ if __name__ == "__main__":
         processor  = whisper_processor()
         embeddings = []
         for file in files:
-            embeddings.append(load_file(file, model, processor, motif_mode=args.motif_mode))
+            embeddings.append(load_file(file, model, processor, motif_mode=args.motif_mode or args.motif_mode_filtered))
         with open(embeddings_path, "wb") as f:
             pkl.dump(embeddings, f)
     print("==========================================")
@@ -67,6 +74,16 @@ if __name__ == "__main__":
     for sequence, full_embedding, _ in embeddings:
         for region_classifications, region_embeddings in sequence:
             candidates.append((region_embeddings, full_embedding, region_classifications))
+
+    if args.motif_mode_filtered:
+        n_before = len(candidates)
+        candidates = filter_candidates_by_medoid(
+            candidates,
+            warping_band=args.dtw_warping_band,
+            epochs=args.dtw_epochs,
+            threshold=args.dtw_threshold,
+        )
+        print(f"DTW medoid filter: {n_before} candidates -> {len(candidates)} medoids")
 
     print("Parameter Sweep HMM")
     results = None
