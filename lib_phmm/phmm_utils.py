@@ -1,6 +1,7 @@
 import numpy as np
 import itertools
 import lib_phmm.profile_hmm as phmm
+import lib_phmm.hierarchical_kmedian_dtw as hkd
 from lib_phmm.compression import *
 
 
@@ -141,6 +142,25 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12):
     )
     hmm = phmm.ProfileHMM(pdf, trans)
     return hmm, n_match_states
+
+
+def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, threshold=1.0):
+    """
+    Cluster candidate motif regions by DTW distance (divisive hierarchical
+    k-medoids -- see lib_phmm/hierarchical_kmedian_dtw.hpp) and keep only
+    the medoid of each resulting leaf cluster. sweep_one_state_count()
+    rescores every candidate against the full candidate pool each round
+    (O(candidates^2) per round), so shrinking the pool here cuts that cost
+    quadratically. Oversplitting (threshold too tight) just leaves
+    redundant candidates for the greedy/BIC sweep to filter out downstream;
+    undersplitting (threshold too loose) can permanently merge two distinct
+    motifs into one medoid, so prefer erring tight.
+    """
+    dataset = [[[float(v) for v in frame] for frame in region_embeddings]
+               for region_embeddings, _, _ in candidates]
+    dm = hkd.DistanceManager(dataset, warping_band)
+    medoid_ids = dm.kmedoids([], epochs, threshold)
+    return [candidates[i] for i in medoid_ids]
 
 
 def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total):

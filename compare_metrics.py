@@ -10,6 +10,7 @@ same way.
 Usage:
   python compare_metrics.py <run_folder_baseline> <run_folder2> [<run_folder3> ...]
 """
+import os
 import numpy as np
 import pandas as pd
 from sys import argv
@@ -41,6 +42,11 @@ KEY_METRICS = [
 
 def load_metrics(run_folder):
     path = f'{run_folder}/metrics.csv'
+    if not os.path.exists(path):
+        # dolphin_msa's evaluate.py writes metrics_average.csv (one summary
+        # row, cluster == 'average') + metrics_per_cluster.csv instead --
+        # same column names, so fall back to that.
+        path = f'{run_folder}/metrics_average.csv'
     df = pd.read_csv(path)
     if len(df) != 1:
         print(f"WARNING: expected exactly 1 row in {path}, found {len(df)} -- using the first row")
