@@ -1,5 +1,6 @@
 import numpy as np
 import itertools
+import random
 import lib_phmm.profile_hmm as phmm
 import lib_phmm.hierarchical_kmedian_dtw as hkd
 from lib_phmm.compression import *
@@ -144,6 +145,11 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12):
     return hmm, n_match_states
 
 
+def _to_dtw_dataset(candidates):
+    return [[[float(v) for v in frame] for frame in region_embeddings]
+            for region_embeddings, _, _ in candidates]
+
+
 def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, threshold=1.0):
     """
     Cluster candidate motif regions by DTW distance (divisive hierarchical
@@ -156,11 +162,38 @@ def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, threshold
     undersplitting (threshold too loose) can permanently merge two distinct
     motifs into one medoid, so prefer erring tight.
     """
-    dataset = [[[float(v) for v in frame] for frame in region_embeddings]
-               for region_embeddings, _, _ in candidates]
+    dataset = _to_dtw_dataset(candidates)
     dm = hkd.DistanceManager(dataset, warping_band)
     medoid_ids = dm.kmedoids([], epochs, threshold)
     return [candidates[i] for i in medoid_ids]
+
+
+def estimate_dtw_threshold(candidates, warping_band=5, n_samples=500, percentile=99, seed=None):
+    """
+    Default --dtw-threshold: DTW distances are normalized by warp-path
+    length (see dtw() in hierarchical_kmedian_dtw.hpp), so this percentile
+    is comparable across candidate pools with differently-sized regions.
+    Sampled pairs are random, so most are distinct-motif pairs rather than
+    near-duplicates -- the 99th percentile therefore sits near the top of
+    that "distinct" distribution, i.e. a lenient default (few splits) that
+    only merges near-exact duplicates. Pass a lower --dtw-threshold
+    explicitly for the tighter clustering filter_candidates_by_medoid
+    otherwise prefers.
+    """
+    dataset = _to_dtw_dataset(candidates)
+    n = len(dataset)
+    max_pairs = n * (n - 1) // 2
+    n_samples = min(n_samples, max_pairs)
+
+    rng = random.Random(seed)
+    pairs = set()
+    while len(pairs) < n_samples:
+        i, j = rng.randrange(n), rng.randrange(n)
+        if i != j:
+            pairs.add((min(i, j), max(i, j)))
+
+    distances = [hkd.dtw(dataset[i], dataset[j], warping_band) for i, j in pairs]
+    return float(np.percentile(distances, percentile))
 
 
 def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total):
