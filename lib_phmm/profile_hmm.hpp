@@ -126,6 +126,9 @@ public:
     return scaler - 0.5 * error;
   }
 
+  const Vec& get_mean() const { return mean; }
+  const Vec& get_variance() const { return variance; }
+
 private:
   Vec mean;
   Vec variance;

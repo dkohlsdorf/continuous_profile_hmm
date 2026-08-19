@@ -22,6 +22,17 @@ PYBIND11_MODULE(profile_hmm, m) {
     .def(py::init<Vec&, Vec&>(), py::arg("mean"), py::arg("variance"))
     .def("ll", &Gaussian::ll, py::arg("x"),
          "Log-likelihood of observation x under this Gaussian")
+    .def(py::pickle(
+      [](const Gaussian& g) {
+        return py::make_tuple(g.get_mean(), g.get_variance());
+      },
+      [](py::tuple t) {
+        if (t.size() != 2) throw std::runtime_error("Invalid Gaussian pickle state");
+        Vec mean = t[0].cast<Vec>();
+        Vec variance = t[1].cast<Vec>();
+        return Gaussian(mean, variance);
+      }
+    ))
     .def("__repr__", [](const Gaussian& g) {
       ostringstream os;
       os << g;
@@ -44,6 +55,42 @@ PYBIND11_MODULE(profile_hmm, m) {
     .def_readwrite("cc", &FlankTransitions::cc)
     .def_readwrite("b_to_hmm", &FlankTransitions::b_to_hmm)
     .def_readwrite("mm", &FlankTransitions::mm)
+    .def(py::pickle(
+      [](const FlankTransitions& t) {
+        // nn/nb/.../mm are stored as log2(probability) -- exp2 recovers
+        // the raw probabilities the constructor expects, so setstate can
+        // reuse it unchanged instead of duplicating its log2 logic.
+        auto exp2_mat = [](const vector<vector<float>>& mat) {
+          vector<vector<float>> out;
+          out.reserve(mat.size());
+          for (auto& row : mat) {
+            vector<float> r;
+            r.reserve(row.size());
+            for (float v : row) r.push_back(exp2(v));
+            out.push_back(std::move(r));
+          }
+          return out;
+        };
+        return py::make_tuple(
+          exp2(t.nn), exp2(t.nb),
+          exp2(t.ec), exp2(t.ej),
+          exp2(t.jj), exp2(t.jb),
+          exp2(t.cc),
+          exp2_mat(t.b_to_hmm), exp2_mat(t.mm)
+        );
+      },
+      [](py::tuple t) {
+        if (t.size() != 9) throw std::runtime_error("Invalid FlankTransitions pickle state");
+        return FlankTransitions(
+          t[0].cast<float>(), t[1].cast<float>(),
+          t[2].cast<float>(), t[3].cast<float>(),
+          t[4].cast<float>(), t[5].cast<float>(),
+          t[6].cast<float>(),
+          t[7].cast<vector<vector<float>>>(),
+          t[8].cast<vector<vector<float>>>()
+        );
+      }
+    ))
     .def("__repr__", [](const FlankTransitions& t) {
       ostringstream os;
       os << t;
@@ -55,6 +102,17 @@ PYBIND11_MODULE(profile_hmm, m) {
          py::arg("pdf"), py::arg("trans"))
     .def_readwrite("pdf", &ProfileHMM::pdf)
     .def_readwrite("trans", &ProfileHMM::trans)
+    .def(py::pickle(
+      [](const ProfileHMM& hmm) {
+        return py::make_tuple(hmm.pdf, hmm.trans);
+      },
+      [](py::tuple t) {
+        if (t.size() != 2) throw std::runtime_error("Invalid ProfileHMM pickle state");
+        auto pdf = t[0].cast<vector<vector<Gaussian>>>();
+        auto trans = t[1].cast<FlankTransitions>();
+        return ProfileHMM(pdf, trans);
+      }
+    ))
     .def("__repr__", [](const ProfileHMM& hmm) {
       ostringstream os;
       os << hmm;
