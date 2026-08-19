@@ -1,6 +1,7 @@
 import numpy as np
 import itertools
 import random
+import time
 import lib_phmm.profile_hmm as phmm
 import lib_phmm.hierarchical_kmedian_dtw as hkd
 from lib_phmm.compression import *
@@ -296,13 +297,32 @@ def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_t
     return local_results
 
 
-def decode_all(embeddings, hmm):
+def decode_all(embeddings, hmm, verbose=False, log_every=None):
+    """
+    verbose logs progress every log_every sequences (default: ~20 log
+    lines spread across the pool, regardless of its size). Off by
+    default since this is called on every greedy candidate trial inside
+    sweep_one_state_count() -- turn it on only for a one-off decode over
+    a large pool, e.g. motif_discovery.py's final full-pool scoring pass.
+    """
+    n_total = len(embeddings)
+    if verbose and log_every is None:
+        log_every = max(1, n_total // 20)
+
     scores = []
     paths  = []
-    for _, embedding, classifications in embeddings:
+    start = time.time() if verbose else None
+    for i, (_, embedding, classifications) in enumerate(embeddings):
         score, path = phmm.viterbi(embedding, hmm)
         scores.append(score)
         paths.append(path)
+        if verbose and ((i + 1) % log_every == 0 or i + 1 == n_total):
+            elapsed = time.time() - start
+            rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+            eta = (n_total - (i + 1)) / rate if rate > 0 else float('inf')
+            print(f"  decoded {i + 1}/{n_total} ({(i + 1) / n_total * 100:.1f}%) "
+                  f"elapsed={elapsed:.1f}s rate={rate:.1f}/s eta={eta:.1f}s")
+
     lengths = [len(embedding) for _, embedding, _ in embeddings]
     scores_norm = [score / n for score, n in zip(scores, lengths)]
     return scores_norm, paths, scores

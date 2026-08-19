@@ -175,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
     parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
+    parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
     parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
     parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior -- higher pulls closer to --flank-dwell-frames, lower lets any real observed NOISE counts matter more")
     args = parser.parse_args()
@@ -233,7 +234,7 @@ if __name__ == "__main__":
     print("==========================================")
     print("Scoring against the full candidate pool    ")
     print("==========================================")
-    scores_norm, paths, raw_scores = decode_all(candidates, hmm)
+    scores_norm, paths, raw_scores = decode_all(candidates, hmm, verbose=args.verbose)
     well_fits, well_fits_scores = best_fit(scores_norm, args.well_fit_threshold)
     total_fit = sum(scores_norm)
 
