@@ -22,9 +22,15 @@ sequence stands in for both the exemplar material (compressed into
 per-column Gaussians) and the sequence that gets Viterbi-decoded /
 scored against the final model.
 
+Because there's no surrounding noise for the model to learn N/C flank
+dwell from, estimate_transitions() would otherwise collapse nn/cc to a
+1-2 frame dwell (see lib_phmm/phmm_utils.py's _smoothed_with_prior
+docstring) -- --flank-dwell-frames/--flank-alpha instead give N/C a
+prior expected dwell on the order of a real candidate length.
+
 The fitted ProfileHMM (a pybind11 object) is pickled directly --
 Gaussian/FlankTransitions/ProfileHMM all carry __getstate__/__setstate__
-now (see profile_hmm_bindings.cpp), so `pkl.load()` on the output file
+(see profile_hmm_bindings.cpp), so `pkl.load()` on the output file
 hands back a live, ready-to-decode model:
 
     with open(output_dir/"phmm_l2.pkl", "rb") as f:
@@ -147,11 +153,12 @@ def filter_by_keep_fraction(candidates, keep_fraction, warping_band, epochs,
     return kept, trace
 
 
-def sweep(candidates):
+def sweep(candidates, flank_dwell_frames=None, flank_alpha=500.0):
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
     nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
-        delayed(sweep_one_state_count)(n_match_states, candidates, MAX_MATCH, D, n_frames_total)
+        delayed(sweep_one_state_count)(n_match_states, candidates, MAX_MATCH, D, n_frames_total,
+                                        flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
         for n_match_states in range(MIN_STATES, MAX_STATES)
     )
     return [r for sublist in nested_results for r in sublist]
@@ -168,6 +175,8 @@ if __name__ == "__main__":
     parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
     parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
+    parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
+    parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior -- higher pulls closer to --flank-dwell-frames, lower lets any real observed NOISE counts matter more")
     args = parser.parse_args()
 
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -190,6 +199,13 @@ if __name__ == "__main__":
             pkl.dump(candidates, f)
     print(f"{len(candidates)} candidates embedded")
 
+    lengths = [len(embedding) for embedding, _, _ in candidates]
+    mean_len, median_len, max_len = float(np.mean(lengths)), float(np.median(lengths)), int(np.max(lengths))
+    print(f"candidate lengths (frames): mean={mean_len:.1f} median={median_len:.1f} max={max_len}")
+
+    flank_dwell_frames = args.flank_dwell_frames if args.flank_dwell_frames is not None else mean_len
+    print(f"flank dwell target: {flank_dwell_frames:.1f} frames (flank_alpha={args.flank_alpha})")
+
     print("==========================================")
     print("DTW hierarchical k-medoid filtering        ")
     print("==========================================")
@@ -207,9 +223,10 @@ if __name__ == "__main__":
     print("==========================================")
     print("Parameter sweep HMM                        ")
     print("==========================================")
-    results = sweep(filtered)
+    results = sweep(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
     best = min(results, key=lambda r: r["bic"])
-    hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"])
+    hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
+                              flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
     n_models = len(hmm.pdf)
     print(f"selected n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f}")
 
@@ -252,6 +269,8 @@ if __name__ == "__main__":
         "keep_fraction": args.keep_fraction,
         "n_candidates_total": len(candidates),
         "n_candidates_filtered": len(filtered),
+        "flank_dwell_frames": flank_dwell_frames,
+        "flank_alpha": args.flank_alpha,
         "run": dt,
     }
     with open(model_path, "wb") as f:

@@ -14,8 +14,34 @@ def _smoothed(self_ct, exit_ct, alpha):
     return (self_ct + alpha) / (self_ct + exit_ct + 2 * alpha)
 
 
+def _smoothed_with_prior(self_ct, exit_ct, alpha, prior_mean):
+    """
+    Beta(alpha*prior_mean, alpha*(1-prior_mean)) conjugate-prior version
+    of _smoothed(): _smoothed(ct, ct', a) is exactly this with
+    prior_mean=0.5, i.e. a Beta(a,a) prior centered at 0.5. That means
+    with no observed self-transitions (self_ct=0, the usual case when
+    there's no real background/noise to learn from), _smoothed() can
+    never push the estimate above 0.5 no matter how large alpha gets --
+    it just interpolates towards its own 0.5 prior. This generalizes to
+    an arbitrary prior mean so a target self-transition probability (and
+    therefore a target expected dwell length, see dwell_to_prior_mean())
+    can be encoded directly instead.
+    """
+    return (self_ct + alpha * prior_mean) / (self_ct + exit_ct + alpha)
+
+
+def dwell_to_prior_mean(frames):
+    """
+    Self-transition probability p whose geometric-distribution mean
+    dwell time (in frames) equals `frames`: mean = 1 / (1 - p), so
+    p = 1 - 1/frames.
+    """
+    return 1.0 - 1.0 / frames
+
+
 def estimate_transitions(alignments, n_match_states,
                           self_alpha=1.0, entry_alpha=0.2, fork_alpha=1.0,
+                          flank_dwell_frames=None, flank_alpha=500.0,
                           fold_internal_gaps=True):
     """
     alignments:     list of per-sequence alignments (each a sequence of
@@ -28,6 +54,16 @@ def estimate_transitions(alignments, n_match_states,
     are estimated per alignment, so mm/b_to_hmm come back as one row per
     input sequence -- ready for p.FlankTransitions(**result) with one
     sub-HMM per sequence.
+
+    flank_dwell_frames: if given, nn/cc (the N/C flank self-transitions)
+    are instead estimated with a prior centered on the self-transition
+    probability implying this expected dwell length in frames (pseudocount
+    weight flank_alpha), rather than the default symmetric self_alpha
+    prior. Use this when the input sequences are already tightly-bounded
+    candidates with little or no real NOISE-labeled background for nn/cc
+    to learn from, but the flank states should still be able to absorb a
+    stretch on the order of a typical/maximal candidate length instead of
+    collapsing to a 1-2 frame dwell.
     """
     n_self_total, n_exit_total = 0, 0
     c_self_total, c_exit_total = 0, 0
@@ -86,9 +122,14 @@ def estimate_transitions(alignments, n_match_states,
         total = sum(b_to_hmm)
         b_to_hmm_rows.append([v / total for v in b_to_hmm])
 
-    nn = _smoothed(n_self_total, n_exit_total, self_alpha)
+    if flank_dwell_frames is not None:
+        prior_mean = dwell_to_prior_mean(flank_dwell_frames)
+        nn = _smoothed_with_prior(n_self_total, n_exit_total, flank_alpha, prior_mean)
+        cc = _smoothed_with_prior(c_self_total, c_exit_total, flank_alpha, prior_mean)
+    else:
+        nn = _smoothed(n_self_total, n_exit_total, self_alpha)
+        cc = _smoothed(c_self_total, c_exit_total, self_alpha)
     nb = 1.0 - nn
-    cc = _smoothed(c_self_total, c_exit_total, self_alpha)
     ec = _smoothed(ec_hits_total, ej_hits_total, fork_alpha)
     ej = 1.0 - ec
     jj, jb = DEFAULT_JJ, DEFAULT_JB
@@ -103,13 +144,17 @@ def estimate_transitions(alignments, n_match_states,
     }
 
 
-def make_hmm(sequences, classifications_list, max_switchpoints=12):
+def make_hmm(sequences, classifications_list, max_switchpoints=12,
+             flank_dwell_frames=None, flank_alpha=500.0):
     """
     Build one ProfileHMM with a shared flank (N/B/E/C/J) and one
     match-state sub-HMM per input sequence -- pdf[n] is sequence n's own
     compressed Gaussians. Every sub-HMM is padded to the same
     n_match_states (the widest any sequence produced), since the C++
     Viterbi assumes all sub-HMMs share one match-state count.
+
+    flank_dwell_frames/flank_alpha are forwarded to estimate_transitions()
+    -- see its docstring.
     """
     compressed = []
     for sequence, classifications in zip(sequences, classifications_list):
@@ -131,7 +176,10 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12):
         pdf.append(states)
         alignments.append([x if x == -1 else x + 1 for x in path])     # M0 sentinel occupies slot 0
 
-    transition_dict = estimate_transitions(alignments, n_match_states=n_match_states)
+    transition_dict = estimate_transitions(
+        alignments, n_match_states=n_match_states,
+        flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
+    )
 
     trans = phmm.FlankTransitions(
         nn=transition_dict['nn'], nb=transition_dict['nb'],
@@ -196,7 +244,8 @@ def estimate_dtw_threshold(candidates, warping_band=5, n_samples=500, percentile
     return float(np.percentile(distances, percentile))
 
 
-def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total):
+def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total,
+                           flank_dwell_frames=None, flank_alpha=500.0):
     best_embeddings = []
     best_classifications = []
     done = set()
@@ -212,7 +261,8 @@ def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_t
         for embedding_id, (embedding, _, classifications) in enumerate(embeddings):
             if embedding_id in done:
                 continue
-            hmm, n_states = make_hmm(best_embeddings + [embedding], best_classifications + [classifications], n_match_states)
+            hmm, n_states = make_hmm(best_embeddings + [embedding], best_classifications + [classifications], n_match_states,
+                                      flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
             scores_norm, paths, raw_scores = decode_all(embeddings, hmm)
             total_fit = sum(scores_norm)
             if best_total < total_fit:
