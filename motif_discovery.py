@@ -22,19 +22,18 @@ sequence stands in for both the exemplar material (compressed into
 per-column Gaussians) and the sequence that gets Viterbi-decoded /
 scored against the final model.
 
-The fitted ProfileHMM is a pybind11 object and is not picklable
-directly, so `model.pkl` stores the reconstructable record
-(exemplar embeddings/classifications + selected n_match_states)
-instead -- rebuild the live model with:
+The fitted ProfileHMM (a pybind11 object) is pickled directly --
+Gaussian/FlankTransitions/ProfileHMM all carry __getstate__/__setstate__
+now (see profile_hmm_bindings.cpp), so `pkl.load()` on the output file
+hands back a live, ready-to-decode model:
 
-    lib_phmm.phmm_utils.make_hmm(
-        record['exemplar_embeddings'],
-        record['exemplar_classifications'],
-        record['n_match_states'],
-    )
+    with open(output_dir/"phmm_l2.pkl", "rb") as f:
+        record = pkl.load(f)
+    score, path = lib_phmm.profile_hmm.viterbi(sequence, record["hmm"])
 
 Usage:
     python motif_discovery.py L2.csv L2.wav output_dir
+    python motif_discovery.py L2.csv L2.wav output_dir --model-name phmm_l2.pkl
 """
 import argparse
 import datetime
@@ -162,7 +161,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv_path", help="CSV with starts,stops sample offsets of full motif candidates")
     parser.add_argument("wav_path", help="wav file the CSV offsets index into")
-    parser.add_argument("output_path", help="output directory for model.pkl and statistics")
+    parser.add_argument("output_path", help="output directory for the model pickle and statistics")
+    parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl)")
     parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
     parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
@@ -238,9 +238,12 @@ if __name__ == "__main__":
     with open(output_path / "filter_trace.json", "w") as f:
         json.dump(trace, f, indent=2)
 
+    model_name = args.model_name or f"phmm_{Path(args.wav_path).stem.lower()}.pkl"
+    model_path = output_path / model_name
     model_record = {
-        "exemplar_embeddings": best["exemplar_embeddings"],
-        "exemplar_classifications": best["exemplar_classifications"],
+        "hmm": hmm,
+        "n_states": n_states,
+        "n_models": n_models,
         "n_match_states": best["n_match_states"],
         "n_sub_models": best["n_sub_models"],
         "bic": best["bic"],
@@ -251,12 +254,9 @@ if __name__ == "__main__":
         "n_candidates_filtered": len(filtered),
         "run": dt,
     }
-    with open(output_path / "model.pkl", "wb") as f:
+    with open(model_path, "wb") as f:
         pkl.dump(model_record, f)
-    print(f"Saved model to {output_path / 'model.pkl'}")
-    print("(ProfileHMM is a pybind11 object and isn't picklable -- rebuild it with "
-          "lib_phmm.phmm_utils.make_hmm(record['exemplar_embeddings'], "
-          "record['exemplar_classifications'], record['n_match_states']))")
+    print(f"Saved model to {model_path}")
 
     print("==========================================")
     print("Done")
