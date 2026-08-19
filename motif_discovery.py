@@ -45,6 +45,7 @@ import argparse
 import datetime
 import json
 import random
+import time
 import pickle as pkl
 from pathlib import Path
 
@@ -65,21 +66,28 @@ MAX_STATES = 32
 MIN_STATES = 3
 
 
-def load_candidates(csv_path, wav_path, model, processor):
+def load_candidates(csv_path, wav_path, model, processor, verbose=False, log_every=1):
     """
     Every row in csv_path is (start, stop) sample offsets into wav_path
     bounding one full motif candidate. No NOISE-classification
     filtering is applied within a candidate -- every analysis window in
     [start, stop) is embedded and kept.
+
+    verbose logs progress every log_every candidates -- each candidate
+    is a real (multi-second) Whisper forward pass over its own windows,
+    so this loop is comparatively slow per item and worth a tighter
+    default log interval than decode_all()'s.
     """
     df = pd.read_csv(csv_path)
     waveform, sr = load_filtered_waveform(wav_path)
     n_samples = waveform.shape[1]
     window = CONFIG['window_size_samples']
+    n_rows = len(df)
 
     candidates = []
     skipped = 0
-    for start, stop in zip(df['starts'], df['stops']):
+    start_time = time.time() if verbose else None
+    for i, (start, stop) in enumerate(zip(df['starts'], df['stops'])):
         start, stop = int(start), min(int(stop), n_samples)
         if stop - start < window:
             skipped += 1
@@ -93,6 +101,13 @@ def load_candidates(csv_path, wav_path, model, processor):
         # here -- a candidate already IS the whole unit of interest, with
         # no surrounding file context for the flank states to model.
         candidates.append((embeddings, embeddings, classifications))
+
+        if verbose and ((i + 1) % log_every == 0 or i + 1 == n_rows):
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+            eta = (n_rows - (i + 1)) / rate if rate > 0 else float('inf')
+            print(f"  embedded {i + 1}/{n_rows} ({(i + 1) / n_rows * 100:.1f}%) "
+                  f"elapsed={elapsed:.1f}s rate={rate:.2f}/s eta={eta:.1f}s")
 
     if skipped:
         print(f"Skipped {skipped}/{len(df)} candidates shorter than one analysis window ({window} samples)")
@@ -195,7 +210,7 @@ if __name__ == "__main__":
     else:
         model      = whisper_model_v2()
         processor  = whisper_processor()
-        candidates = load_candidates(args.csv_path, args.wav_path, model, processor)
+        candidates = load_candidates(args.csv_path, args.wav_path, model, processor, verbose=args.verbose)
         with open(candidates_path, "wb") as f:
             pkl.dump(candidates, f)
     print(f"{len(candidates)} candidates embedded")
