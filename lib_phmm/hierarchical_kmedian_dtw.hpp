@@ -22,18 +22,12 @@ inline double euc(Vec &x, Vec &y) {
   return distance;
 }
 
-inline double min3(double x, double y, double z) {
-  double min = x;
-  if(y < min) min = y;
-  if(z < min) min = z;
-  return min;
-}
-
 inline double dtw(Mat &x, Mat &y, int warping_band) {
   int n = x.size();
   int m = y.size();
 
   Mat dp = Mat(n + 1, Vec(m + 1, INFINITY));
+  vector<vector<int>> plen(n + 1, vector<int>(m + 1, 0));
   dp[0][0] = 0.0;
 
   int w = max(warping_band, abs(n - m));
@@ -42,14 +36,24 @@ inline double dtw(Mat &x, Mat &y, int warping_band) {
     int j_start = max(1, i - w);
     int j_end = min(m, i + w);
     for(int j = j_start; j <= j_end; j++) {
-      dp[i][j] = min3(dp[i - 1][j],
-		      dp[i - 1][j - 1],
-		      dp[i][j - 1]);
-      dp[i][j] += euc(x[i - 1], y[j - 1]);
+      double up   = dp[i - 1][j];
+      double diag = dp[i - 1][j - 1];
+      double left = dp[i][j - 1];
+
+      // same tie-break order as the old min3(up, diag, left)
+      double best = up;
+      int best_len = plen[i - 1][j];
+      if(diag < best) { best = diag; best_len = plen[i - 1][j - 1]; }
+      if(left < best) { best = left; best_len = plen[i][j - 1]; }
+
+      dp[i][j] = best + euc(x[i - 1], y[j - 1]);
+      plen[i][j] = best_len + 1;
     }
   }
 
-  return dp[n][m];
+  // normalize by warp-path length so distance is comparable across
+  // candidate regions of different durations
+  return dp[n][m] / plen[n][m];
 }
 
 inline int instance_pair_hash(int i, int j, int n_instances) {

@@ -24,13 +24,12 @@ if __name__ == "__main__":
     parser.add_argument("--motif-mode-filtered", action="store_true", help="like --motif-mode, but first cluster candidate regions by DTW distance (hierarchical k-medoids) and only pass the resulting medoids into the HMM sweep")
     parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance, used by --motif-mode-filtered")
     parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split, used by --motif-mode-filtered")
-    parser.add_argument("--dtw-threshold", type=float, default=None, help="stop splitting a branch once its average intra-cluster DTW distance drops below this -- required with --motif-mode-filtered, since a bad default silently over- or under-splits")
+    parser.add_argument("--dtw-threshold", type=float, default=None, help="stop splitting a branch once its average intra-cluster DTW distance drops below this -- default: estimated from --dtw-threshold-percentile of sampled candidate pair distances")
+    parser.add_argument("--dtw-threshold-percentile", type=float, default=99, help="when --dtw-threshold is not given, estimate it as this percentile of DTW distances over --dtw-threshold-samples random candidate pairs")
+    parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="number of random candidate pairs to sample when estimating --dtw-threshold")
     parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
     parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
     args = parser.parse_args()
-
-    if args.motif_mode_filtered and args.dtw_threshold is None:
-        parser.error("--motif-mode-filtered requires --dtw-threshold (no safe default -- depends on your embedding scale)")
 
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     path = args.path
@@ -76,12 +75,23 @@ if __name__ == "__main__":
             candidates.append((region_embeddings, full_embedding, region_classifications))
 
     if args.motif_mode_filtered:
+        threshold = args.dtw_threshold
+        if threshold is None:
+            threshold = estimate_dtw_threshold(
+                candidates,
+                warping_band=args.dtw_warping_band,
+                n_samples=args.dtw_threshold_samples,
+                percentile=args.dtw_threshold_percentile,
+            )
+            print(f"Estimated --dtw-threshold: {threshold} "
+                  f"({args.dtw_threshold_percentile}th percentile over {args.dtw_threshold_samples} sampled candidate pairs)")
+
         n_before = len(candidates)
         candidates = filter_candidates_by_medoid(
             candidates,
             warping_band=args.dtw_warping_band,
             epochs=args.dtw_epochs,
-            threshold=args.dtw_threshold,
+            threshold=threshold,
         )
         print(f"DTW medoid filter: {n_before} candidates -> {len(candidates)} medoids")
 
