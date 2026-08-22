@@ -1,0 +1,21 @@
+# CPU-only PyTorch wheels -- matches how this pipeline actually runs
+# today (whisper_model_v2() only checks torch.cuda.is_available(), and
+# the dev machine this was built on has no CUDA either). Swap this index
+# for a CUDA one and add the nvidia container runtime if you need GPU.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch
+torchaudio
+numpy
+pandas
+joblib
+matplotlib
+transformers
+peft
+pybind11
+
+# gdrive_upload.py -- same client libraries as
+# dolphin_msa/serverless/runpod_worker/handler.py
+google-api-python-client
+google-auth
+google-auth-httplib2
