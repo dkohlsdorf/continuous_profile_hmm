@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# contains live GOOGLE_REFRESH_TOKEN/CLIENT_ID/CLIENT_SECRET in plaintext
+motif_discovery_job/run_config.json

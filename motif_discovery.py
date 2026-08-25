@@ -73,7 +73,7 @@ from joblib import Parallel, delayed
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
 from lib_phmm.signals import load_filtered_waveform, process, classify
-from lib_phmm.phmm_utils import sweep_one_state_count, make_hmm, decode_all, best_fit
+from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
 import lib_phmm.hierarchical_kmedian_dtw as hkd
@@ -227,6 +227,23 @@ def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=
     return [r for sublist in nested_results for r in sublist]
 
 
+def sweep_all_medoids(candidates, flank_dwell_frames=None, flank_alpha=500.0):
+    """
+    --all-medoids counterpart to sweep(): every filtered candidate
+    becomes a sub-model unconditionally (score_all_as_submodels()), so
+    this is one make_hmm()+decode_all() per n_match_states value instead
+    of sweep()'s O(max_match * candidates^2) greedy search per value --
+    --max-match is unused here. Only n_match_states is still BIC-picked.
+    """
+    D = candidates[0][0].shape[1]
+    n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
+    return Parallel(n_jobs=-1, backend="loky", verbose=10)(
+        delayed(score_all_as_submodels)(n_match_states, candidates, D, n_frames_total,
+                                         flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
+        for n_match_states in range(MIN_STATES, MAX_STATES)
+    )
+
+
 def assign_submodels(paths, n_states):
     """
     For each Viterbi path, the sub-model index (n) most represented
@@ -281,7 +298,8 @@ if __name__ == "__main__":
     parser.add_argument("output_path", help="output directory for the model pickle and statistics")
     parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl). If it already exists, it's loaded instead of recomputing DTW filtering + the sweep.")
     parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
-    parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap")
+    parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
+    parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
     parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
@@ -369,8 +387,12 @@ if __name__ == "__main__":
         print("==========================================")
         print("Parameter sweep HMM                        ")
         print("==========================================")
-        print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
-        results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
+        if args.all_medoids:
+            print(f"all_medoids: every one of {n_filtered} filtered candidates becomes a sub-model (--max-match ignored)")
+            results = sweep_all_medoids(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
+        else:
+            print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
+            results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
         best = min(results, key=lambda r: r["bic"])
         hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
                                   flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
@@ -437,6 +459,7 @@ if __name__ == "__main__":
             "n_candidates_total": len(candidates),
             "n_candidates_filtered": n_filtered,
             "max_match": args.max_match,
+            "all_medoids": args.all_medoids,
             "flank_dwell_frames": flank_dwell_frames,
             "flank_alpha": args.flank_alpha,
             "run": dt,

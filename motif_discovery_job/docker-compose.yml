@@ -1,5 +1,7 @@
 services:
   motif-discovery:
+    image: dkohlsdorf/motif-discovery:latest
+    platform: linux/amd64
     build:
       context: ..
       dockerfile: motif_discovery_job/Dockerfile

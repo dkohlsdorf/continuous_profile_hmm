@@ -297,6 +297,40 @@ def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_t
     return local_results
 
 
+def score_all_as_submodels(n_match_states, embeddings, dim, n_frames_total,
+                            flank_dwell_frames=None, flank_alpha=500.0):
+    """
+    Like sweep_one_state_count(), but skips the greedy exemplar
+    selection entirely: every sequence in `embeddings` becomes its own
+    sub-model, unconditionally. sweep_one_state_count() spends
+    O(max_match * candidates^2) deciding *which* candidates to add as
+    sub-models -- pointless work once max_match is large enough that
+    the answer is always "all of them" anyway (e.g. after DTW medoid
+    filtering already thinned the pool to the set you want). This does
+    one make_hmm() + one decode_all() per n_match_states value instead,
+    same BIC formula, same result shape as sweep_one_state_count()'s.
+    """
+    all_embeddings = [embedding for embedding, _, _ in embeddings]
+    all_classifications = [classifications for _, _, classifications in embeddings]
+
+    hmm, n_states = make_hmm(all_embeddings, all_classifications, n_match_states,
+                              flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
+    scores_norm, paths, raw_scores = decode_all(embeddings, hmm)
+
+    n_sub_models = len(all_embeddings)
+    ll_nats = sum(raw_scores) * np.log(2)
+    k = count_params(n_sub_models, n_match_states, dim)
+    bic = k * np.log(n_frames_total) - 2 * ll_nats
+
+    return {
+        "n_match_states": n_match_states,
+        "n_sub_models": n_sub_models,
+        "bic": bic,
+        "exemplar_embeddings": all_embeddings,
+        "exemplar_classifications": all_classifications,
+    }
+
+
 def decode_all(embeddings, hmm, verbose=False, log_every=None):
     """
     verbose logs progress every log_every sequences (default: ~20 log
