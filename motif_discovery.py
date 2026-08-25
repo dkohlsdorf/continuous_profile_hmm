@@ -1,20 +1,33 @@
 """
 motif_discovery.py
 
-Standalone motif-discovery pipeline for one long recording with
-pre-annotated candidate regions (e.g. L2.csv/L2.wav, where L2.csv has
-`starts,stops` sample offsets into L2.wav bounding each full motif
-candidate):
+Two subcommands:
 
-  1. embed every candidate (no NOISE-classification filtering -- the
-     candidate boundaries are already given, so every analysis window
-     inside [start, stop) is kept)
-  2. thin the candidate pool with DTW hierarchical k-medoid filtering
-     down to --keep-fraction of the original candidates
-  3. run the same BIC-driven match-state / sub-model sweep used by
-     processing.py to fit a profile HMM on the filtered pool
-  4. decode every candidate (the full, unfiltered pool) against the
-     final model and write, per candidate, which sub-model it matched
+  train -- fit a profile HMM motif model from CSV-bounded candidate
+  regions in one recording (e.g. L2.csv/L2.wav, where L2.csv has
+  `starts,stops` sample offsets into L2.wav bounding each full motif
+  candidate):
+
+    1. embed every candidate (no NOISE-classification filtering -- the
+       candidate boundaries are already given, so every analysis window
+       inside [start, stop) is kept)
+    2. thin the candidate pool with DTW hierarchical k-medoid filtering
+       down to --keep-fraction of the original candidates
+    3. run the same BIC-driven match-state / sub-model sweep used by
+       processing.py to fit a profile HMM on the filtered pool
+    4. decode every candidate (the full, unfiltered pool) against the
+       final model and write, per candidate, which sub-model it matched
+
+  find -- given a model `train` produced, search a (potentially large,
+  unbounded) recording for occurrences of its motifs: embed the whole
+  file continuously, Viterbi-decode it in one pass, and read off every
+  B..E span the path visits as one motif hit, labeled by which
+  sub-model it matched. This falls out of the profile HMM's own
+  topology for free -- the E->J->B loop-back already exists so a
+  single decode can walk through any number of motif occurrences
+  separated by background (N/J/C), so "search" is not a new algorithm,
+  just reading segments back off a path the same way
+  lib_phmm.visualization.extract_match_wav already does for plotting.
 
 Unlike processing.py's --motif-mode-filtered (which decodes every
 candidate against its parent *file's* full embedding sequence so the
@@ -44,20 +57,33 @@ of re-running DTW filtering + the sweep (delete it, or pass a different
 --model-name, to force a recompute). Candidate embeddings are cached
 the same way, in candidates.pkl.
 
-Besides the model pickle and metrics.csv, this also writes:
+Besides the model pickle and metrics.csv, `train` also writes:
   - submodel_assignments.csv: one row per candidate (start, stop,
     which sub-model its Viterbi path matched most, its normalized fit
     score) -- submodel_id is -1 if the path visited no match state.
   - submodel_<n>.wav: one file per sub-model id, the raw audio of every
     candidate assigned to it concatenated back to back.
 
+`find` writes:
+  - motif_hits.csv: one row per detected motif occurrence (which
+    sub-model, start/stop in samples and seconds, length in frames).
+  - submodel_<n>_hits.wav: one file per sub-model id, the raw audio of
+    every hit for it concatenated back to back.
+  - embeddings.pkl: cached whole-file embedding, since embedding a
+    large recording end to end is the slow part here (no candidates.pkl
+    equivalent to reuse -- this is a continuous scan, not per-candidate
+    slices) and you'll often want to try more than one model against
+    the same target file.
+
 Usage:
-    python motif_discovery.py L2.csv L2.wav output_dir
-    python motif_discovery.py L2.csv L2.wav output_dir --model-name phmm_l2.pkl
+    python motif_discovery.py train L2.csv L2.wav output_dir
+    python motif_discovery.py train L2.csv L2.wav output_dir --model-name phmm_l2.pkl
+    python motif_discovery.py find output_dir/phmm_l2.pkl target.wav search_dir --verbose
 """
 import argparse
 import datetime
 import json
+import math
 import random
 import time
 import wave
@@ -73,7 +99,7 @@ from joblib import Parallel, delayed
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
 from lib_phmm.signals import load_filtered_waveform, process, classify
-from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit
+from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
 import lib_phmm.hierarchical_kmedian_dtw as hkd
@@ -265,50 +291,100 @@ def assign_submodels(paths, n_states):
     return assignments
 
 
-def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path):
+def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, suffix=""):
     """
-    One submodel_<n>.wav per sub-model id: the raw audio of every
-    candidate assigned to it (per assign_submodels), concatenated back
-    to back in candidate order. Re-loads/filters the source wav rather
-    than reusing anything from load_candidates(), since candidates may
-    have come from the candidates.pkl cache this run.
+    One submodel_<n><suffix>.wav per sub-model id: the raw audio of
+    every (span, submodel_id) pair assigned to it, concatenated back to
+    back in span order. Used for both training's whole-candidate spans
+    (assign_submodels()) and search's motif-hit spans
+    (extract_motif_segments()) -- same shape either way: a list of
+    (start, stop) sample spans and a parallel list of submodel ids.
+    Re-loads/filters the source wav rather than reusing an
+    already-loaded one, since the caller's embeddings may have come
+    from a pkl cache this run.
     """
     waveform, sr = load_filtered_waveform(wav_path)
     n_samples = waveform.shape[1]
     for n in range(n_models):
         idxs = [i for i, sid in enumerate(submodel_ids) if sid == n]
         if not idxs:
-            print(f"  submodel {n}: no candidates assigned, skipping audio export")
+            print(f"  submodel {n}: nothing assigned, skipping audio export")
             continue
         clips = [waveform[:, spans[i][0]:min(spans[i][1], n_samples)] for i in idxs]
         concatenated = torch.cat(clips, dim=1)
-        out_file = output_path / f"submodel_{n}.wav"
+        out_file = output_path / f"submodel_{n}{suffix}.wav"
         torchaudio.save(str(out_file), concatenated, sr)
-        print(f"  submodel {n}: {len(idxs)} candidates -> {out_file}")
+        print(f"  submodel {n}: {len(idxs)} -> {out_file}")
 
     n_unassigned = sum(1 for sid in submodel_ids if sid == -1)
     if n_unassigned:
-        print(f"  {n_unassigned} candidates had no match-state visits (submodel_id=-1), excluded from audio export")
+        print(f"  {n_unassigned} had no match-state visits (submodel_id=-1), excluded from audio export")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("csv_path", help="CSV with starts,stops sample offsets of full motif candidates")
-    parser.add_argument("wav_path", help="wav file the CSV offsets index into")
-    parser.add_argument("output_path", help="output directory for the model pickle and statistics")
-    parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl). If it already exists, it's loaded instead of recomputing DTW filtering + the sweep.")
-    parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
-    parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
-    parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
-    parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
-    parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
-    parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
-    parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
-    parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
-    parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
-    parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior -- higher pulls closer to --flank-dwell-frames, lower lets any real observed NOISE counts matter more")
-    args = parser.parse_args()
+def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
+    """
+    Embed an entire (potentially long) recording via the same sliding
+    window as load_candidates(), but continuously across the whole file
+    instead of per-candidate slices -- for `find`, not `train`. Returns
+    (embeddings, step_samples): an (n_windows, D) array and the sample
+    hop between windows, needed to convert frame indices in a Viterbi
+    path back to sample offsets.
+    """
+    waveform, sr = load_filtered_waveform(wav_path)
+    step_samples = CONFIG['window_size_samples'] // CONFIG['step_denominator']
+    n_expected = -(-waveform.shape[1] // step_samples)  # ceil division
 
+    if verbose and log_every is None:
+        log_every = max(1, n_expected // 20)
+
+    raw_embeddings = []
+    start_time = time.time() if verbose else None
+    for i, result in enumerate(process(waveform, model, processor)):
+        raw_embeddings.append(result['embeddings'])
+        if verbose and ((i + 1) % log_every == 0 or i + 1 == n_expected):
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+            eta = (n_expected - (i + 1)) / rate if rate > 0 else float('inf')
+            print(f"  embedded {i + 1}/{n_expected} windows ({(i + 1) / n_expected * 100:.1f}%) "
+                  f"elapsed={elapsed:.1f}s rate={rate:.2f}/s eta={eta:.1f}s")
+
+    embeddings = np.array(raw_embeddings)
+    embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
+    return embeddings, step_samples
+
+
+def extract_motif_segments(path, n_states):
+    """
+    Walk a Viterbi path and return (start_frame, stop_frame, submodel)
+    for each contiguous B..E domain -- one entry per detected motif
+    occurrence. Frame indices are into the decoded embedding sequence;
+    multiply by embed_full_file()'s step_samples to get sample offsets.
+
+    Segment-tracking logic adapted from
+    lib_phmm.visualization.extract_match_wav, stripped of the
+    audio-reconstruction machinery that function also does for
+    plotting -- not needed here, this only wants the spans.
+    """
+    segments = []
+    seg_start, seg_stop, seg_model = None, None, None
+    for step in path:
+        if step.state == phmm.B:
+            seg_start, seg_stop, seg_model = None, None, None
+        elif step.state == phmm.E:
+            if seg_start is not None:
+                segments.append((seg_start, seg_stop, seg_model))
+            seg_start, seg_stop, seg_model = None, None, None
+        elif step.state >= phmm.MATCH_STATE:
+            idx = step.state - phmm.MATCH_STATE
+            n = idx // n_states
+            if seg_start is None:
+                seg_start = step.time
+                seg_model = n
+            seg_stop = step.time
+    return segments
+
+
+def run_train(args):
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     output_path = Path(args.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -473,3 +549,140 @@ if __name__ == "__main__":
     print("==========================================")
     print("Done")
     print("==========================================")
+
+
+def run_find(args):
+    output_path = Path(args.output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    print("==========================================")
+    print("Motif search: loading model                ")
+    print("==========================================")
+    with open(args.model_path, "rb") as f:
+        model_record = pkl.load(f)
+    hmm      = model_record["hmm"]
+    n_states = model_record["n_states"]
+    n_models = model_record["n_models"]
+    print(f"Loaded model from {args.model_path} "
+          f"(n_match_states={model_record['n_match_states']}, n_sub_models={model_record['n_sub_models']})")
+
+    # `ec`/`ej` (E -> C "done, background forever" vs E -> J "loop back,
+    # keep scanning for another occurrence") were estimated from training
+    # candidates, each of which contains exactly one motif occurrence by
+    # construction -- estimate_transitions() only ever observes the "one
+    # motif then exit" event (ec_hits_total += 1, unconditionally, once
+    # per exemplar) and never an ej event, so ec comes out of training
+    # near 1 regardless of the data. C has no transition back out of it
+    # in this topology, so left as trained, Viterbi would exit to C after
+    # the *first* hit here and silently absorb every later occurrence
+    # into one long C run instead of finding it. Override for search:
+    # keep the model looping (E->J->B) so multiple hits in one long file
+    # actually get found.
+    hmm.trans.ej = math.log2(args.repeat_prob)
+    hmm.trans.ec = math.log2(1.0 - args.repeat_prob)
+
+    # jj/jb (J's own self-transition -- how long the model tolerates
+    # dwelling in J, i.e. background *between* two motif occurrences,
+    # before giving up and trying B anyway) are hardcoded constants in
+    # phmm_utils.py (DEFAULT_JJ=0.01), never estimated from data --
+    # mean dwell ~1 frame. That's fine once ej routes the path into J at
+    # all, but the "memory" of having just exited a match decays almost
+    # immediately (~6.6 bits/frame), so any real gap of more than a
+    # couple of frames between occurrences already loses the next hit
+    # before it starts. Override with a gap tolerance sized for this
+    # search, same dwell_to_prior_mean() math train's --flank-dwell-frames
+    # uses for N/C.
+    jj = dwell_to_prior_mean(args.gap_dwell_frames)
+    hmm.trans.jj = math.log2(jj)
+    hmm.trans.jb = math.log2(1.0 - jj)
+
+    print("==========================================")
+    print("Motif search: embedding target file        ")
+    print("==========================================")
+    embeddings_path = output_path / "embeddings.pkl"
+    if embeddings_path.exists():
+        with open(embeddings_path, "rb") as f:
+            embeddings, step_samples = pkl.load(f)
+        print(f"Loaded cached embeddings from: {embeddings_path}")
+    else:
+        whisper_model = whisper_model_v2()
+        processor     = whisper_processor()
+        embeddings, step_samples = embed_full_file(args.wav_path, whisper_model, processor, verbose=args.verbose)
+        with open(embeddings_path, "wb") as f:
+            pkl.dump((embeddings, step_samples), f)
+    print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop)")
+
+    print("==========================================")
+    print("Motif search: decoding                     ")
+    print("==========================================")
+    score, path = phmm.viterbi(embeddings, hmm)
+    print(f"Viterbi score: {score:.1f}")
+
+    segments = extract_motif_segments(path, n_states)
+    print(f"Found {len(segments)} motif occurrences")
+
+    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _ in segments]
+    hit_submodel_ids = [model for _, _, model in segments]
+
+    print("==========================================")
+    print("Motif search: writing hits                 ")
+    print("==========================================")
+    hits_df = pd.DataFrame({
+        "hit_id": range(len(segments)),
+        "submodel_id": hit_submodel_ids,
+        "start_sample": [s for s, _ in hit_spans],
+        "stop_sample": [e for _, e in hit_spans],
+        "start_time_s": [s / CONFIG['sampling_rate'] for s, _ in hit_spans],
+        "stop_time_s": [e / CONFIG['sampling_rate'] for _, e in hit_spans],
+        "n_frames": [stop - start + 1 for start, stop, _ in segments],
+    })
+    hits_path = output_path / "motif_hits.csv"
+    hits_df.to_csv(hits_path, index=False)
+    print(f"Saved {len(segments)} hits to {hits_path}")
+
+    print("==========================================")
+    print("Motif search: per-submodel hit audio       ")
+    print("==========================================")
+    if segments:
+        write_submodel_audio(args.wav_path, hit_spans, hit_submodel_ids, n_models, output_path, suffix="_hits")
+    else:
+        print("  no hits, nothing to export")
+
+    print("==========================================")
+    print("Done")
+    print("==========================================")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    train_parser = subparsers.add_parser("train", help="fit a profile HMM motif model from CSV-bounded candidate regions")
+    train_parser.add_argument("csv_path", help="CSV with starts,stops sample offsets of full motif candidates")
+    train_parser.add_argument("wav_path", help="wav file the CSV offsets index into")
+    train_parser.add_argument("output_path", help="output directory for the model pickle and statistics")
+    train_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl). If it already exists, it's loaded instead of recomputing DTW filtering + the sweep.")
+    train_parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
+    train_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
+    train_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
+    train_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
+    train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
+    train_parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
+    train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
+    train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
+    train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
+    train_parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior -- higher pulls closer to --flank-dwell-frames, lower lets any real observed NOISE counts matter more")
+
+    find_parser = subparsers.add_parser("find", help="search a fitted model's motifs in a (potentially large) recording")
+    find_parser.add_argument("model_path", help="model pickle produced by `train` (e.g. output_dir/phmm_l2.pkl)")
+    find_parser.add_argument("wav_path", help="recording to search for motifs")
+    find_parser.add_argument("output_path", help="output directory for motif_hits.csv, embeddings.pkl cache, and submodel_<n>_hits.wav")
+    find_parser.add_argument("--verbose", action="store_true", help="log progress while embedding the target file")
+    find_parser.add_argument("--repeat-prob", type=float, default=0.999, help="probability of looping back (E->J->B) to keep scanning for another occurrence after a hit, instead of exiting to background forever (E->C, a dead end in this topology) -- overrides the trained ec/ej, which come from single-occurrence training candidates and are unusable for scanning a long file as-is (see run_find()'s comment). Default strongly favors continuing to scan.")
+    find_parser.add_argument("--gap-dwell-frames", type=float, default=100.0, help="expected background gap (in frames) the model should tolerate between two motif occurrences before giving up on finding another one nearby -- overrides jj/jb, hardcoded elsewhere to a ~1-frame dwell (fine within training, unusable for scanning a file with real gaps between hits). Generous default: underestimating this risks missing real hits, overestimating mainly costs a bit of false-positive risk once inside a real match.")
+
+    args = parser.parse_args()
+    if args.mode == "train":
+        run_train(args)
+    else:
+        run_find(args)
