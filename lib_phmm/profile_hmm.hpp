@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 #include <algorithm>
+#include <optional>
 
 using namespace std;
 
@@ -190,7 +191,8 @@ inline string state_name(int state, int n_models, int match_state_per_model) {
 }
 
 
-inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm) {
+inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
+                                           optional<Gaussian> noise_pdf = nullopt) {
   int n_models = phmm.pdf.size();
   int match_state_per_model = phmm.pdf[0].size();
   int n_states = match_state_per_model * n_models + MATCH_STATE;
@@ -238,18 +240,29 @@ inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm)
       }
     }
 
-    W[i][N]  = W[i-1][N] + phmm.trans.nn;
+    // Silent by default (noise_emission=0), matching every existing
+    // caller (train/processing.py never pass noise_pdf) exactly as
+    // before: N/J/C carry no data-dependent signal, only transition
+    // cost, so a frame only has to be *cheaper than the transition
+    // cost* to get pulled into a match run -- there's no competing
+    // hypothesis saying "this looks like background, not motif". When
+    // find's --noise-wav supplies a noise_pdf, N/J/C become a real
+    // rival hypothesis scored against the same data match states are,
+    // same way ll()/log(2.0) is already used for match emissions.
+    double noise_emission = noise_pdf.has_value() ? (noise_pdf->ll(sequence[i]) / log(2.0)) : 0.0;
+
+    W[i][N]  = W[i-1][N] + phmm.trans.nn + noise_emission;
     TB[i][N] = {i-1, N};
 
     double from_jj = W[i-1][J] + phmm.trans.jj;
     double from_ej = W[i-1][E] + phmm.trans.ej;
-    if (from_jj >= from_ej) { W[i][J] = from_jj; TB[i][J] = {i-1, J}; }
-    else                     { W[i][J] = from_ej; TB[i][J] = {i-1, E}; }
+    if (from_jj >= from_ej) { W[i][J] = from_jj + noise_emission; TB[i][J] = {i-1, J}; }
+    else                     { W[i][J] = from_ej + noise_emission; TB[i][J] = {i-1, E}; }
 
     double from_cc = W[i-1][C] + phmm.trans.cc;
     double from_ec = W[i][E]   + phmm.trans.ec;
-    if (from_cc >= from_ec) { W[i][C] = from_cc; TB[i][C] = {i-1, C}; }
-    else                    { W[i][C] = from_ec;  TB[i][C] = {i,   E}; }
+    if (from_cc >= from_ec) { W[i][C] = from_cc + noise_emission; TB[i][C] = {i-1, C}; }
+    else                    { W[i][C] = from_ec + noise_emission;  TB[i][C] = {i,   E}; }
 
     double from_nb = W[i-1][N] + phmm.trans.nb;
     double from_jb = W[i][J]   + phmm.trans.jb;

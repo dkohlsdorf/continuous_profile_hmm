@@ -353,34 +353,45 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
     return embeddings, step_samples
 
 
-def extract_motif_segments(path, n_states):
+def extract_motif_segments(path, hmm, n_states, embeddings):
     """
-    Walk a Viterbi path and return (start_frame, stop_frame, submodel)
-    for each contiguous B..E domain -- one entry per detected motif
-    occurrence. Frame indices are into the decoded embedding sequence;
-    multiply by embed_full_file()'s step_samples to get sample offsets.
+    Walk a Viterbi path and return (start_frame, stop_frame, submodel,
+    mean_score) for each contiguous B..E domain -- one entry per
+    detected motif occurrence. Frame indices are into the decoded
+    embedding sequence; multiply by embed_full_file()'s step_samples to
+    get sample offsets.
+
+    mean_score is the mean per-frame emission log2-likelihood
+    (hmm.pdf[n][k].ll(embeddings[time]), same conversion viterbi() uses
+    internally) over the segment's matched frames -- a match-quality
+    signal that's independent of apply_search_transitions()'s ec/ej/jj/jb
+    overrides, so it's useful for filtering false positives that the
+    loop-back bias let through on transition-prior cheapness alone
+    rather than genuine acoustic similarity.
 
     Segment-tracking logic adapted from
     lib_phmm.visualization.extract_match_wav, stripped of the
     audio-reconstruction machinery that function also does for
-    plotting -- not needed here, this only wants the spans.
+    plotting -- not needed here, this only wants the spans (+ score).
     """
     segments = []
-    seg_start, seg_stop, seg_model = None, None, None
+    seg_start, seg_stop, seg_model, seg_scores = None, None, None, []
     for step in path:
         if step.state == phmm.B:
-            seg_start, seg_stop, seg_model = None, None, None
+            seg_start, seg_stop, seg_model, seg_scores = None, None, None, []
         elif step.state == phmm.E:
             if seg_start is not None:
-                segments.append((seg_start, seg_stop, seg_model))
-            seg_start, seg_stop, seg_model = None, None, None
+                mean_score = sum(seg_scores) / len(seg_scores)
+                segments.append((seg_start, seg_stop, seg_model, mean_score))
+            seg_start, seg_stop, seg_model, seg_scores = None, None, None, []
         elif step.state >= phmm.MATCH_STATE:
             idx = step.state - phmm.MATCH_STATE
-            n = idx // n_states
+            n, k = idx // n_states, idx % n_states
             if seg_start is None:
                 seg_start = step.time
                 seg_model = n
             seg_stop = step.time
+            seg_scores.append(hmm.pdf[n][k].ll(embeddings[step.time]) / math.log(2.0))
     return segments
 
 
@@ -551,50 +562,83 @@ def run_train(args):
     print("==========================================")
 
 
-def run_find(args):
-    output_path = Path(args.output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
+def apply_search_transitions(hmm, repeat_prob, gap_dwell_frames):
+    """
+    Mutate a loaded model's flank transitions in place for `find`'s
+    "many occurrences in one long file" decode -- both overrides are
+    read-write pybind11 fields, no retraining needed.
 
-    print("==========================================")
-    print("Motif search: loading model                ")
-    print("==========================================")
-    with open(args.model_path, "rb") as f:
-        model_record = pkl.load(f)
-    hmm      = model_record["hmm"]
-    n_states = model_record["n_states"]
-    n_models = model_record["n_models"]
-    print(f"Loaded model from {args.model_path} "
-          f"(n_match_states={model_record['n_match_states']}, n_sub_models={model_record['n_sub_models']})")
+    `ec`/`ej` (E -> C "done, background forever" vs E -> J "loop back,
+    keep scanning for another occurrence") were estimated from training
+    candidates, each of which contains exactly one motif occurrence by
+    construction -- estimate_transitions() only ever observes the "one
+    motif then exit" event (ec_hits_total += 1, unconditionally, once
+    per exemplar) and never an ej event, so ec comes out of training
+    near 1 regardless of the data. C has no transition back out of it
+    in this topology, so left as trained, Viterbi would exit to C after
+    the *first* hit here and silently absorb every later occurrence
+    into one long C run instead of finding it.
 
-    # `ec`/`ej` (E -> C "done, background forever" vs E -> J "loop back,
-    # keep scanning for another occurrence") were estimated from training
-    # candidates, each of which contains exactly one motif occurrence by
-    # construction -- estimate_transitions() only ever observes the "one
-    # motif then exit" event (ec_hits_total += 1, unconditionally, once
-    # per exemplar) and never an ej event, so ec comes out of training
-    # near 1 regardless of the data. C has no transition back out of it
-    # in this topology, so left as trained, Viterbi would exit to C after
-    # the *first* hit here and silently absorb every later occurrence
-    # into one long C run instead of finding it. Override for search:
-    # keep the model looping (E->J->B) so multiple hits in one long file
-    # actually get found.
-    hmm.trans.ej = math.log2(args.repeat_prob)
-    hmm.trans.ec = math.log2(1.0 - args.repeat_prob)
-
-    # jj/jb (J's own self-transition -- how long the model tolerates
-    # dwelling in J, i.e. background *between* two motif occurrences,
-    # before giving up and trying B anyway) are hardcoded constants in
-    # phmm_utils.py (DEFAULT_JJ=0.01), never estimated from data --
-    # mean dwell ~1 frame. That's fine once ej routes the path into J at
-    # all, but the "memory" of having just exited a match decays almost
-    # immediately (~6.6 bits/frame), so any real gap of more than a
-    # couple of frames between occurrences already loses the next hit
-    # before it starts. Override with a gap tolerance sized for this
-    # search, same dwell_to_prior_mean() math train's --flank-dwell-frames
-    # uses for N/C.
-    jj = dwell_to_prior_mean(args.gap_dwell_frames)
+    jj/jb (J's own self-transition -- how long the model tolerates
+    dwelling in J, i.e. background *between* two motif occurrences,
+    before giving up and trying B anyway) are hardcoded constants in
+    phmm_utils.py (DEFAULT_JJ=0.01), never estimated from data -- mean
+    dwell ~1 frame. That's fine once ej routes the path into J at all,
+    but the "memory" of having just exited a match decays almost
+    immediately (~6.6 bits/frame), so any real gap of more than a
+    couple of frames between occurrences already loses the next hit
+    before it starts. gap_dwell_frames sizes a gap tolerance for this
+    search, same dwell_to_prior_mean() math train's --flank-dwell-frames
+    uses for N/C.
+    """
+    hmm.trans.ej = math.log2(repeat_prob)
+    hmm.trans.ec = math.log2(1.0 - repeat_prob)
+    jj = dwell_to_prior_mean(gap_dwell_frames)
     hmm.trans.jj = math.log2(jj)
     hmm.trans.jb = math.log2(1.0 - jj)
+
+
+def build_noise_model(noise_wav_path, output_path, var_floor=0.1, verbose=False):
+    """
+    Ad-hoc "background" emission model for find --noise-wav: one
+    Gaussian (mean/var per embedding dim) fit to the whole file's
+    embeddings. This is find-only and never touches train/processing.py
+    or the saved model -- see viterbi()'s optional noise_pdf argument
+    (profile_hmm.hpp) for why giving N/J/C a real emission model helps:
+    without it they're silent/transition-only, so a frame only has to
+    be cheaper than the transition cost to get pulled into a match run,
+    with no competing "this looks like background" hypothesis scored
+    against the same data. var_floor matches compress()'s default
+    (lib_phmm/compression.py) -- guards against a near-zero variance
+    dimension blowing up Gaussian.ll()'s division.
+    """
+    output_path.mkdir(parents=True, exist_ok=True)
+    embeddings_path = output_path / "noise_embeddings.pkl"
+    if embeddings_path.exists():
+        with open(embeddings_path, "rb") as f:
+            embeddings, _ = pkl.load(f)
+        print(f"Loaded cached noise embeddings from: {embeddings_path}")
+    else:
+        whisper_model = whisper_model_v2()
+        processor     = whisper_processor()
+        embeddings, step_samples = embed_full_file(noise_wav_path, whisper_model, processor, verbose=verbose)
+        with open(embeddings_path, "wb") as f:
+            pkl.dump((embeddings, step_samples), f)
+    print(f"Noise model fit from {len(embeddings)} windows of {noise_wav_path}")
+
+    mean = embeddings.mean(axis=0)
+    var = np.maximum(embeddings.var(axis=0), var_floor)
+    return phmm.Gaussian(mean, var)
+
+
+def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False):
+    """
+    Search one recording for hmm's motifs: embed it (cached to
+    embeddings.pkl under output_path), Viterbi-decode in one pass, and
+    write motif_hits.csv + submodel_<n>_hits.wav under output_path.
+    Returns the segments found (see extract_motif_segments()).
+    """
+    output_path.mkdir(parents=True, exist_ok=True)
 
     print("==========================================")
     print("Motif search: embedding target file        ")
@@ -607,7 +651,7 @@ def run_find(args):
     else:
         whisper_model = whisper_model_v2()
         processor     = whisper_processor()
-        embeddings, step_samples = embed_full_file(args.wav_path, whisper_model, processor, verbose=args.verbose)
+        embeddings, step_samples = embed_full_file(wav_path, whisper_model, processor, verbose=verbose)
         with open(embeddings_path, "wb") as f:
             pkl.dump((embeddings, step_samples), f)
     print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop)")
@@ -615,14 +659,15 @@ def run_find(args):
     print("==========================================")
     print("Motif search: decoding                     ")
     print("==========================================")
-    score, path = phmm.viterbi(embeddings, hmm)
+    score, path = phmm.viterbi(embeddings, hmm, noise_pdf)
     print(f"Viterbi score: {score:.1f}")
 
-    segments = extract_motif_segments(path, n_states)
+    segments = extract_motif_segments(path, hmm, n_states, embeddings)
     print(f"Found {len(segments)} motif occurrences")
 
-    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _ in segments]
-    hit_submodel_ids = [model for _, _, model in segments]
+    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _, _ in segments]
+    hit_submodel_ids = [model for _, _, model, _ in segments]
+    hit_scores = [score for _, _, _, score in segments]
 
     print("==========================================")
     print("Motif search: writing hits                 ")
@@ -634,7 +679,8 @@ def run_find(args):
         "stop_sample": [e for _, e in hit_spans],
         "start_time_s": [s / CONFIG['sampling_rate'] for s, _ in hit_spans],
         "stop_time_s": [e / CONFIG['sampling_rate'] for _, e in hit_spans],
-        "n_frames": [stop - start + 1 for start, stop, _ in segments],
+        "n_frames": [stop - start + 1 for start, stop, _, _ in segments],
+        "mean_emission_score": hit_scores,
     })
     hits_path = output_path / "motif_hits.csv"
     hits_df.to_csv(hits_path, index=False)
@@ -644,9 +690,56 @@ def run_find(args):
     print("Motif search: per-submodel hit audio       ")
     print("==========================================")
     if segments:
-        write_submodel_audio(args.wav_path, hit_spans, hit_submodel_ids, n_models, output_path, suffix="_hits")
+        write_submodel_audio(wav_path, hit_spans, hit_submodel_ids, n_models, output_path, suffix="_hits")
     else:
         print("  no hits, nothing to export")
+
+    return segments
+
+
+def run_find(args):
+    print("==========================================")
+    print("Motif search: loading model                ")
+    print("==========================================")
+    with open(args.model_path, "rb") as f:
+        model_record = pkl.load(f)
+    hmm      = model_record["hmm"]
+    n_states = model_record["n_states"]
+    n_models = model_record["n_models"]
+    print(f"Loaded model from {args.model_path} "
+          f"(n_match_states={model_record['n_match_states']}, n_sub_models={model_record['n_sub_models']})")
+
+    apply_search_transitions(hmm, args.repeat_prob, args.gap_dwell_frames)
+
+    output_path = Path(args.output_path)
+    wav_path = Path(args.wav_path)
+
+    noise_pdf = None
+    if args.noise_wav is not None:
+        print("==========================================")
+        print("Motif search: building noise model         ")
+        print("==========================================")
+        noise_pdf = build_noise_model(Path(args.noise_wav), output_path, verbose=args.verbose)
+
+    if wav_path.is_dir():
+        wav_files = sorted(wav_path.glob("*.wav"))
+        print(f"{args.wav_path} is a directory -- found {len(wav_files)} wav files")
+        if not wav_files:
+            print("Nothing to search, exiting")
+            return
+        # one motif_hits.csv/embeddings.pkl/submodel_<n>_hits.wav set per
+        # wav file, namespaced under output_path/<wav stem>/ so files
+        # can't collide with each other's output. noise_pdf (if any) is
+        # built once above and reused across every file.
+        for i, wav_file in enumerate(wav_files):
+            print("==========================================")
+            print(f"[{i + 1}/{len(wav_files)}] {wav_file.name}")
+            print("==========================================")
+            find_in_file(wav_file, output_path / wav_file.stem, hmm, n_states, n_models,
+                         noise_pdf=noise_pdf, verbose=args.verbose)
+    else:
+        output_path.mkdir(parents=True, exist_ok=True)
+        find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=noise_pdf, verbose=args.verbose)
 
     print("==========================================")
     print("Done")
@@ -675,11 +768,12 @@ if __name__ == "__main__":
 
     find_parser = subparsers.add_parser("find", help="search a fitted model's motifs in a (potentially large) recording")
     find_parser.add_argument("model_path", help="model pickle produced by `train` (e.g. output_dir/phmm_l2.pkl)")
-    find_parser.add_argument("wav_path", help="recording to search for motifs")
+    find_parser.add_argument("wav_path", help="recording to search for motifs, or a directory of .wav files to search each of independently (one output_path/<wav stem>/ subfolder per file)")
     find_parser.add_argument("output_path", help="output directory for motif_hits.csv, embeddings.pkl cache, and submodel_<n>_hits.wav")
     find_parser.add_argument("--verbose", action="store_true", help="log progress while embedding the target file")
     find_parser.add_argument("--repeat-prob", type=float, default=0.999, help="probability of looping back (E->J->B) to keep scanning for another occurrence after a hit, instead of exiting to background forever (E->C, a dead end in this topology) -- overrides the trained ec/ej, which come from single-occurrence training candidates and are unusable for scanning a long file as-is (see run_find()'s comment). Default strongly favors continuing to scan.")
     find_parser.add_argument("--gap-dwell-frames", type=float, default=100.0, help="expected background gap (in frames) the model should tolerate between two motif occurrences before giving up on finding another one nearby -- overrides jj/jb, hardcoded elsewhere to a ~1-frame dwell (fine within training, unusable for scanning a file with real gaps between hits). Generous default: underestimating this risks missing real hits, overestimating mainly costs a bit of false-positive risk once inside a real match.")
+    find_parser.add_argument("--noise-wav", default=None, help="optional recording of background/non-motif audio. If given, N/J/C (background states) get a real emission model -- one Gaussian fit to this file's embeddings -- competing against match states for each frame, instead of being silent/transition-only. This is what actually fixes segments bleeding into surrounding noise (widened start/stop spans), which --repeat-prob/--gap-dwell-frames don't touch at all (those only control whether to look for another occurrence, not how tightly one occurrence's span is drawn). Ad hoc for this run only -- never touches train/processing.py or the saved model. Omit to keep today's behavior exactly.")
 
     args = parser.parse_args()
     if args.mode == "train":

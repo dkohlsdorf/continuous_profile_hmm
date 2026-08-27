@@ -48,6 +48,13 @@ def load_file(filename, model, processor, motif_mode=False):
 
 def load_filtered_waveform(filename):
     waveform, sr = torchaudio.load(filename)
+    if waveform.shape[0] > 1:
+        # process()'s x.squeeze() only drops size-1 dims, so a multi-channel
+        # waveform reaches the Whisper feature extractor as 2D instead of
+        # the 1D it expects, breaking its internal padding. Every file this
+        # pipeline was built/trained against happens to be mono already, so
+        # this is a no-op there -- only multi-channel input hits it.
+        waveform = waveform[:1]
     waveform = torchaudio.functional.highpass_biquad(
         waveform, sr, CONFIG['min_frequency_hz']
     )

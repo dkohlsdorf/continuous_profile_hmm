@@ -136,6 +136,9 @@ PYBIND11_MODULE(profile_hmm, m) {
         "Return a human-readable name for a state index.");
 
   m.def("viterbi", &viterbi,
-        py::arg("sequence"), py::arg("phmm"),
-        "Run Viterbi decoding. Returns (log2_score, path) where path is a list of Pred.");
+        py::arg("sequence"), py::arg("phmm"), py::arg("noise_pdf") = py::none(),
+        "Run Viterbi decoding. Returns (log2_score, path) where path is a list of Pred. "
+        "noise_pdf: optional Gaussian giving N/J/C a real emission model (competing "
+        "against match states) instead of the default silent/transition-only behavior "
+        "-- see profile_hmm.hpp's viterbi() comment.");
 }
