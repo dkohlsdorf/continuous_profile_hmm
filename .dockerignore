@@ -1,0 +1,19 @@
+.git
+.gitignore
+.DS_Store
+.claude
+
+# built C++ extensions / build artifacts -- rebuilt fresh inside the image
+lib_phmm/build/
+lib_phmm/*.so
+lib_phmm/__pycache__/
+lib_phmm/profile_hmm.egg-info/
+__pycache__/
+
+# local run outputs -- bind-mounted over at run time locally (see
+# docker-compose.yml), not baked into the image. Anchored to the repo
+# root only -- motif_discovery_job/data/motif/ is the staged data that
+# DOES get baked in (see motif_discovery_job/Dockerfile) and must not
+# match here.
+/motif/
+results_summary.txt

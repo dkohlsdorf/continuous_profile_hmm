@@ -224,3 +224,8 @@ __marimo__/
 
 # contains live GOOGLE_REFRESH_TOKEN/CLIENT_ID/CLIENT_SECRET in plaintext
 motif_discovery_job/run_config.json
+
+# staged Docker build data (L2.wav/L2.csv/candidates.pkl copies baked into
+# the motif-discovery image) -- derived, machine-local, and L2.wav alone
+# (~636MB) exceeds GitHub's 100MB file-size limit
+motif_discovery_job/data/
