@@ -13,6 +13,7 @@ matplotlib
 transformers
 peft
 pybind11
+scikit-learn
 
 # gdrive_upload.py -- same client libraries as
 # dolphin_msa/serverless/runpod_worker/handler.py

@@ -39,6 +39,25 @@ PYBIND11_MODULE(profile_hmm, m) {
       return os.str();
     });
 
+  py::class_<MixtureModel>(m, "MixtureModel")
+    .def(py::init<vector<Gaussian>, Vec>(), py::arg("components"), py::arg("log_weights"),
+         "components: list of Gaussian. log_weights: mixture weights in log space "
+         "(not raw probabilities -- e.g. np.log(sklearn GaussianMixture.weights_)), "
+         "same length as components.")
+    .def("ll", &MixtureModel::ll, py::arg("x"),
+         "Log-likelihood of observation x under this mixture (log-sum-exp over components).")
+    .def(py::pickle(
+      [](const MixtureModel& mm) {
+        return py::make_tuple(mm.get_components(), mm.get_log_weights());
+      },
+      [](py::tuple t) {
+        if (t.size() != 2) throw std::runtime_error("Invalid MixtureModel pickle state");
+        auto components = t[0].cast<vector<Gaussian>>();
+        auto log_weights = t[1].cast<Vec>();
+        return MixtureModel(components, log_weights);
+      }
+    ));
+
   py::class_<FlankTransitions>(m, "FlankTransitions")
     .def(py::init<float, float, float, float, float, float, float, vector<vector<float>>, vector<vector<float>>>(),
          py::arg("nn"), py::arg("nb"),
@@ -138,7 +157,7 @@ PYBIND11_MODULE(profile_hmm, m) {
   m.def("viterbi", &viterbi,
         py::arg("sequence"), py::arg("phmm"), py::arg("noise_pdf") = py::none(),
         "Run Viterbi decoding. Returns (log2_score, path) where path is a list of Pred. "
-        "noise_pdf: optional Gaussian giving N/J/C a real emission model (competing "
+        "noise_pdf: optional MixtureModel giving N/J/C a real emission model (competing "
         "against match states) instead of the default silent/transition-only behavior "
         "-- see profile_hmm.hpp's viterbi() comment.");
 }

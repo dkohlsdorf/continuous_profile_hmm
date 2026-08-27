@@ -104,6 +104,7 @@ from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_
 import lib_phmm.profile_hmm as phmm
 import lib_phmm.hierarchical_kmedian_dtw as hkd
 
+from sklearn.mixture import GaussianMixture
 
 MAX_MATCH  = 5
 MAX_STATES = 32
@@ -598,19 +599,31 @@ def apply_search_transitions(hmm, repeat_prob, gap_dwell_frames):
     hmm.trans.jb = math.log2(1.0 - jj)
 
 
-def build_noise_model(noise_wav_path, output_path, var_floor=0.1, verbose=False):
+def build_noise_model(noise_wav_path, output_path, n_components=None, var_floor=0.1, verbose=False, seed=None):
     """
-    Ad-hoc "background" emission model for find --noise-wav: one
-    Gaussian (mean/var per embedding dim) fit to the whole file's
-    embeddings. This is find-only and never touches train/processing.py
-    or the saved model -- see viterbi()'s optional noise_pdf argument
-    (profile_hmm.hpp) for why giving N/J/C a real emission model helps:
-    without it they're silent/transition-only, so a frame only has to
-    be cheaper than the transition cost to get pulled into a match run,
-    with no competing "this looks like background" hypothesis scored
-    against the same data. var_floor matches compress()'s default
-    (lib_phmm/compression.py) -- guards against a near-zero variance
-    dimension blowing up Gaussian.ll()'s division.
+    Ad-hoc "background" emission model for find --noise-wav: a
+    MixtureModel fit to the whole file's embeddings. Find-only, never
+    touches train/processing.py or the saved model -- see viterbi()'s
+    optional noise_pdf argument (profile_hmm.hpp) for why giving N/J/C a
+    real emission model helps: without it they're silent/transition-only,
+    so a frame only has to be cheaper than the transition cost to get
+    pulled into a match run, with no competing "this looks like
+    background" hypothesis scored against the same data.
+
+    n_components=None (default): single Gaussian, no EM -- mean/var
+    computed directly, weight 1 (log_weight=0.0). This is exactly a
+    1-component MixtureModel, verified to score identically to a bare
+    Gaussian.
+
+    n_components=k: sklearn.mixture.GaussianMixture(n_components=k,
+    covariance_type='diag', init_params='k-means++'), one Gaussian per
+    fitted component. sklearn's weights_ are raw probabilities, not log
+    -- MixtureModel expects log_weights, so these get np.log()'d before
+    construction.
+
+    var_floor (matches compress()'s default in lib_phmm/compression.py)
+    guards against a near-zero-variance dimension blowing up
+    Gaussian.ll()'s division, for both paths.
     """
     output_path.mkdir(parents=True, exist_ok=True)
     embeddings_path = output_path / "noise_embeddings.pkl"
@@ -626,9 +639,23 @@ def build_noise_model(noise_wav_path, output_path, var_floor=0.1, verbose=False)
             pkl.dump((embeddings, step_samples), f)
     print(f"Noise model fit from {len(embeddings)} windows of {noise_wav_path}")
 
-    mean = embeddings.mean(axis=0)
-    var = np.maximum(embeddings.var(axis=0), var_floor)
-    return phmm.Gaussian(mean, var)
+    if n_components is None:
+        mean = embeddings.mean(axis=0)
+        var = np.maximum(embeddings.var(axis=0), var_floor)
+        print("Noise model: single Gaussian (no EM)")
+        return phmm.MixtureModel([phmm.Gaussian(mean, var)], [0.0])
+
+    gmm = GaussianMixture(n_components=n_components, covariance_type='diag',
+                           init_params='k-means++', random_state=seed)
+    gmm.fit(embeddings)
+    components = [
+        phmm.Gaussian(gmm.means_[i], np.maximum(gmm.covariances_[i], var_floor))
+        for i in range(n_components)
+    ]
+    log_weights = np.log(gmm.weights_).tolist()  # weights_ are raw probabilities, not log
+    print(f"Noise model: {n_components}-component GMM (diag covariance, k-means++ init), "
+          f"weights={[f'{w:.3f}' for w in gmm.weights_]}")
+    return phmm.MixtureModel(components, log_weights)
 
 
 def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False):
@@ -719,7 +746,8 @@ def run_find(args):
         print("==========================================")
         print("Motif search: building noise model         ")
         print("==========================================")
-        noise_pdf = build_noise_model(Path(args.noise_wav), output_path, verbose=args.verbose)
+        noise_pdf = build_noise_model(Path(args.noise_wav), output_path,
+                                       n_components=args.noise_components, verbose=args.verbose)
 
     if wav_path.is_dir():
         wav_files = sorted(wav_path.glob("*.wav"))
@@ -773,7 +801,8 @@ if __name__ == "__main__":
     find_parser.add_argument("--verbose", action="store_true", help="log progress while embedding the target file")
     find_parser.add_argument("--repeat-prob", type=float, default=0.999, help="probability of looping back (E->J->B) to keep scanning for another occurrence after a hit, instead of exiting to background forever (E->C, a dead end in this topology) -- overrides the trained ec/ej, which come from single-occurrence training candidates and are unusable for scanning a long file as-is (see run_find()'s comment). Default strongly favors continuing to scan.")
     find_parser.add_argument("--gap-dwell-frames", type=float, default=100.0, help="expected background gap (in frames) the model should tolerate between two motif occurrences before giving up on finding another one nearby -- overrides jj/jb, hardcoded elsewhere to a ~1-frame dwell (fine within training, unusable for scanning a file with real gaps between hits). Generous default: underestimating this risks missing real hits, overestimating mainly costs a bit of false-positive risk once inside a real match.")
-    find_parser.add_argument("--noise-wav", default=None, help="optional recording of background/non-motif audio. If given, N/J/C (background states) get a real emission model -- one Gaussian fit to this file's embeddings -- competing against match states for each frame, instead of being silent/transition-only. This is what actually fixes segments bleeding into surrounding noise (widened start/stop spans), which --repeat-prob/--gap-dwell-frames don't touch at all (those only control whether to look for another occurrence, not how tightly one occurrence's span is drawn). Ad hoc for this run only -- never touches train/processing.py or the saved model. Omit to keep today's behavior exactly.")
+    find_parser.add_argument("--noise-wav", default=None, help="optional recording of background/non-motif audio. If given, N/J/C (background states) get a real emission model -- a MixtureModel fit to this file's embeddings (see --noise-components) -- competing against match states for each frame, instead of being silent/transition-only. This is what actually fixes segments bleeding into surrounding noise (widened start/stop spans), which --repeat-prob/--gap-dwell-frames don't touch at all (those only control whether to look for another occurrence, not how tightly one occurrence's span is drawn). Ad hoc for this run only -- never touches train/processing.py or the saved model. Omit to keep today's behavior exactly.")
+    find_parser.add_argument("--noise-components", type=int, default=None, help="number of Gaussian components (k) for the --noise-wav mixture model. Omit for a single Gaussian fit directly (mean/var, no EM) -- the default. If given, fits sklearn.mixture.GaussianMixture(n_components=k, covariance_type='diag', init_params='k-means++') instead. Ignored if --noise-wav isn't set.")
 
     args = parser.parse_args()
     if args.mode == "train":

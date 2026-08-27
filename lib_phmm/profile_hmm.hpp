@@ -137,6 +137,45 @@ private:
 };
 
 
+double log_add(double lx, double ly) {
+  if (isinf(lx)) {
+    return ly;
+  }
+  if (isinf(ly)) {
+    return lx;
+  }
+  
+  if (lx > ly) {
+    return lx + log1p(exp(ly - lx));
+  } else {
+    return ly + log1p(exp(lx - ly));
+  }
+}
+
+
+class MixtureModel {
+public:
+  MixtureModel(vector<Gaussian> components, Vec log_weights):
+    components(components), log_weights(log_weights) {}
+
+  double ll(const Vec &x) {
+    double ll = -INFINITY;
+    int n = log_weights.size();
+    for(int i = 0; i < n; i++) {
+      ll = log_add(ll, components[i].ll(x) + log_weights[i]);
+    }
+    return ll;
+  }
+
+  const vector<Gaussian>& get_components() const { return components; }
+  const Vec& get_log_weights() const { return log_weights; }
+
+private:
+  vector<Gaussian> components;
+  Vec log_weights;
+};
+
+
 class ProfileHMM {
 public:
   ProfileHMM(vector<vector<Gaussian>>& pdf, FlankTransitions& trans)
@@ -192,7 +231,7 @@ inline string state_name(int state, int n_models, int match_state_per_model) {
 
 
 inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
-                                           optional<Gaussian> noise_pdf = nullopt) {
+                                           optional<MixtureModel> noise_pdf = nullopt) {
   int n_models = phmm.pdf.size();
   int match_state_per_model = phmm.pdf[0].size();
   int n_states = match_state_per_model * n_models + MATCH_STATE;
