@@ -67,8 +67,10 @@ Besides the model pickle and metrics.csv, `train` also writes:
 `find` writes:
   - motif_hits.csv: one row per detected motif occurrence (which
     sub-model, start/stop in samples and seconds, length in frames).
-  - submodel_<n>_hits.wav: one file per sub-model id, the raw audio of
-    every hit for it concatenated back to back.
+  - submodel_<n>_hits.wav: written per sub-model id (raw audio of every
+    hit for it concatenated back to back), then always deleted right
+    after -- motif_hits.csv has everything needed to re-derive them
+    from the source wav, so they aren't kept around.
   - embeddings.pkl: cached whole-file embedding, since embedding a
     large recording end to end is the slow part here (no candidates.pkl
     equivalent to reuse -- this is a continuous scan, not per-candidate
@@ -104,7 +106,7 @@ from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_
 import lib_phmm.profile_hmm as phmm
 import lib_phmm.hierarchical_kmedian_dtw as hkd
 
-from sklearn.mixture import GaussianMixture
+from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 
 MAX_MATCH  = 5
 MAX_STATES = 32
@@ -599,7 +601,8 @@ def apply_search_transitions(hmm, repeat_prob, gap_dwell_frames):
     hmm.trans.jb = math.log2(1.0 - jj)
 
 
-def build_noise_model(noise_wav_path, output_path, n_components=None, var_floor=0.1, verbose=False, seed=None):
+def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=False,
+                       var_floor=0.1, var_scale=1.0, verbose=False, seed=None):
     """
     Ad-hoc "background" emission model for find --noise-wav: a
     MixtureModel fit to the whole file's embeddings. Find-only, never
@@ -615,15 +618,37 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, var_floor=
     1-component MixtureModel, verified to score identically to a bare
     Gaussian.
 
-    n_components=k: sklearn.mixture.GaussianMixture(n_components=k,
-    covariance_type='diag', init_params='k-means++'), one Gaussian per
-    fitted component. sklearn's weights_ are raw probabilities, not log
-    -- MixtureModel expects log_weights, so these get np.log()'d before
-    construction.
+    n_components=k, bayesian=False (default when k given):
+    sklearn.mixture.GaussianMixture(n_components=k, covariance_type='diag',
+    init_params='k-means++') -- exactly k components.
+
+    n_components=k, bayesian=True: sklearn.mixture.BayesianGaussianMixture
+    with k as an upper bound, not a target -- its Dirichlet process
+    weight-concentration prior drives unneeded components' weights
+    toward ~0 on its own (verified: capping at 6 on 2 true clusters left
+    4 components at ~0 weight), so you don't have to search for the
+    right k yourself. Components whose weight is ~0 (<1e-3) are dropped
+    entirely rather than kept as dead weight in the mixture.
+
+    Both GaussianMixture and BayesianGaussianMixture expose the same
+    post-fit shape (means_/covariances_/weights_), so both paths share
+    the same extraction code below. sklearn's weights_ are raw
+    probabilities either way, not log -- MixtureModel expects
+    log_weights, so these get np.log()'d before construction.
 
     var_floor (matches compress()'s default in lib_phmm/compression.py)
     guards against a near-zero-variance dimension blowing up
-    Gaussian.ll()'s division, for both paths.
+    Gaussian.ll()'s division, for every path.
+
+    var_scale > 1.0 inflates every fitted covariance (after the floor is
+    applied) by this factor -- a cheap knob for "the noise pdf is too
+    narrow, real background keeps out-scoring it as motif" without
+    needing to collect more/broader noise recordings. Widening the
+    Gaussians raises the noise pdf's likelihood over a larger region of
+    embedding space, so more background frames score competitively
+    against match states in viterbi(). Trade-off: too high starts
+    swallowing real motif frames into background too. Default 1.0 keeps
+    today's fit untouched.
     """
     output_path.mkdir(parents=True, exist_ok=True)
     embeddings_path = output_path / "noise_embeddings.pkl"
@@ -641,20 +666,31 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, var_floor=
 
     if n_components is None:
         mean = embeddings.mean(axis=0)
-        var = np.maximum(embeddings.var(axis=0), var_floor)
-        print("Noise model: single Gaussian (no EM)")
+        var = np.maximum(embeddings.var(axis=0), var_floor) * var_scale
+        scale_note = f", var_scale={var_scale}" if var_scale != 1.0 else ""
+        print(f"Noise model: single Gaussian (no EM){scale_note}")
         return phmm.MixtureModel([phmm.Gaussian(mean, var)], [0.0])
 
-    gmm = GaussianMixture(n_components=n_components, covariance_type='diag',
-                           init_params='k-means++', random_state=seed)
+    if bayesian:
+        gmm = BayesianGaussianMixture(n_components=n_components, covariance_type='diag',
+                                       init_params='k-means++',
+                                       weight_concentration_prior_type='dirichlet_process',
+                                       random_state=seed)
+    else:
+        gmm = GaussianMixture(n_components=n_components, covariance_type='diag',
+                               init_params='k-means++', random_state=seed)
     gmm.fit(embeddings)
+
+    active = gmm.weights_ > 1e-3
     components = [
-        phmm.Gaussian(gmm.means_[i], np.maximum(gmm.covariances_[i], var_floor))
-        for i in range(n_components)
+        phmm.Gaussian(gmm.means_[i], np.maximum(gmm.covariances_[i], var_floor) * var_scale)
+        for i in range(n_components) if active[i]
     ]
-    log_weights = np.log(gmm.weights_).tolist()  # weights_ are raw probabilities, not log
-    print(f"Noise model: {n_components}-component GMM (diag covariance, k-means++ init), "
-          f"weights={[f'{w:.3f}' for w in gmm.weights_]}")
+    log_weights = np.log(gmm.weights_[active]).tolist()  # weights_ are raw probabilities, not log
+    kind = f"Bayesian GMM (Dirichlet process, cap k={n_components})" if bayesian else f"GMM (exactly k={n_components})"
+    scale_note = f", var_scale={var_scale}" if var_scale != 1.0 else ""
+    print(f"Noise model: {kind}, diag covariance, k-means++ init{scale_note}, "
+          f"{active.sum()}/{n_components} active components, weights={[f'{w:.3f}' for w in gmm.weights_[active]]}")
     return phmm.MixtureModel(components, log_weights)
 
 
@@ -662,7 +698,9 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     """
     Search one recording for hmm's motifs: embed it (cached to
     embeddings.pkl under output_path), Viterbi-decode in one pass, and
-    write motif_hits.csv + submodel_<n>_hits.wav under output_path.
+    write motif_hits.csv under output_path (submodel_<n>_hits.wav clips
+    are written then immediately deleted -- see write_submodel_audio()
+    call below).
     Returns the segments found (see extract_motif_segments()).
     """
     output_path.mkdir(parents=True, exist_ok=True)
@@ -718,6 +756,15 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     print("==========================================")
     if segments:
         write_submodel_audio(wav_path, hit_spans, hit_submodel_ids, n_models, output_path, suffix="_hits")
+        # find's submodel_<n>_hits.wav clips are useful for a quick listen
+        # right after this run but aren't kept long-term (motif_hits.csv
+        # has everything needed to re-derive them from the source wav) --
+        # always delete them once written, unlike train's plain
+        # submodel_<n>.wav (no suffix), which stays.
+        hit_wav_files = sorted(output_path.glob("submodel_*_hits.wav"))
+        for f in hit_wav_files:
+            f.unlink()
+        print(f"  deleted {len(hit_wav_files)} submodel_*_hits.wav file(s)")
     else:
         print("  no hits, nothing to export")
 
@@ -743,11 +790,15 @@ def run_find(args):
 
     noise_pdf = None
     if args.noise_wav is not None:
+        if args.noise_bayesian and args.noise_components is None:
+            raise SystemExit("--noise-bayesian needs --noise-components (used as the "
+                              "upper bound on components, not an exact count)")
         print("==========================================")
         print("Motif search: building noise model         ")
         print("==========================================")
         noise_pdf = build_noise_model(Path(args.noise_wav), output_path,
-                                       n_components=args.noise_components, verbose=args.verbose)
+                                       n_components=args.noise_components, bayesian=args.noise_bayesian,
+                                       var_scale=args.noise_var_scale, verbose=args.verbose)
 
     if wav_path.is_dir():
         wav_files = sorted(wav_path.glob("*.wav"))
@@ -797,12 +848,14 @@ if __name__ == "__main__":
     find_parser = subparsers.add_parser("find", help="search a fitted model's motifs in a (potentially large) recording")
     find_parser.add_argument("model_path", help="model pickle produced by `train` (e.g. output_dir/phmm_l2.pkl)")
     find_parser.add_argument("wav_path", help="recording to search for motifs, or a directory of .wav files to search each of independently (one output_path/<wav stem>/ subfolder per file)")
-    find_parser.add_argument("output_path", help="output directory for motif_hits.csv, embeddings.pkl cache, and submodel_<n>_hits.wav")
+    find_parser.add_argument("output_path", help="output directory for motif_hits.csv and embeddings.pkl cache (submodel_<n>_hits.wav clips are written per sub-model then always deleted right after -- not kept)")
     find_parser.add_argument("--verbose", action="store_true", help="log progress while embedding the target file")
     find_parser.add_argument("--repeat-prob", type=float, default=0.999, help="probability of looping back (E->J->B) to keep scanning for another occurrence after a hit, instead of exiting to background forever (E->C, a dead end in this topology) -- overrides the trained ec/ej, which come from single-occurrence training candidates and are unusable for scanning a long file as-is (see run_find()'s comment). Default strongly favors continuing to scan.")
     find_parser.add_argument("--gap-dwell-frames", type=float, default=100.0, help="expected background gap (in frames) the model should tolerate between two motif occurrences before giving up on finding another one nearby -- overrides jj/jb, hardcoded elsewhere to a ~1-frame dwell (fine within training, unusable for scanning a file with real gaps between hits). Generous default: underestimating this risks missing real hits, overestimating mainly costs a bit of false-positive risk once inside a real match.")
     find_parser.add_argument("--noise-wav", default=None, help="optional recording of background/non-motif audio. If given, N/J/C (background states) get a real emission model -- a MixtureModel fit to this file's embeddings (see --noise-components) -- competing against match states for each frame, instead of being silent/transition-only. This is what actually fixes segments bleeding into surrounding noise (widened start/stop spans), which --repeat-prob/--gap-dwell-frames don't touch at all (those only control whether to look for another occurrence, not how tightly one occurrence's span is drawn). Ad hoc for this run only -- never touches train/processing.py or the saved model. Omit to keep today's behavior exactly.")
-    find_parser.add_argument("--noise-components", type=int, default=None, help="number of Gaussian components (k) for the --noise-wav mixture model. Omit for a single Gaussian fit directly (mean/var, no EM) -- the default. If given, fits sklearn.mixture.GaussianMixture(n_components=k, covariance_type='diag', init_params='k-means++') instead. Ignored if --noise-wav isn't set.")
+    find_parser.add_argument("--noise-components", type=int, default=None, help="number of Gaussian components (k) for the --noise-wav mixture model. Omit for a single Gaussian fit directly (mean/var, no EM) -- the default. Otherwise fits sklearn.mixture.GaussianMixture(n_components=k) with exactly k components, or -- with --noise-bayesian -- BayesianGaussianMixture using k as an upper bound instead of an exact count. Ignored if --noise-wav isn't set.")
+    find_parser.add_argument("--noise-bayesian", action="store_true", help="use sklearn.mixture.BayesianGaussianMixture (Dirichlet process prior) instead of a plain GaussianMixture for --noise-components -- its own weight-concentration prior drives unneeded components' weights toward ~0 on its own, so --noise-components acts as an upper bound rather than a count you have to get exactly right. Requires --noise-components (used as that upper bound).")
+    find_parser.add_argument("--noise-var-scale", type=float, default=1.0, help="multiply every fitted noise-model covariance (after the var_floor clamp) by this factor. >1 widens the noise Gaussians so background scores competitively against match states over a larger region of embedding space -- a quick way to fight motif segments bleeding into noise without collecting more/broader --noise-wav recordings. Too high starts eating real motif frames into background instead. Default 1.0 (no change). Ignored if --noise-wav isn't set.")
 
     args = parser.parse_args()
     if args.mode == "train":
