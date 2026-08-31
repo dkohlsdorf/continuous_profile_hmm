@@ -229,3 +229,11 @@ motif_discovery_job/run_config.json
 # the motif-discovery image) -- derived, machine-local, and L2.wav alone
 # (~636MB) exceeds GitHub's 100MB file-size limit
 motif_discovery_job/data/
+
+# staged Docker build data for the runpod find worker (phmm_l2.pkl/
+# naive_noise.wav copies baked into the image, since /motif/ above and
+# the noise wav's source directory are both otherwise unreachable from
+# or excluded from the build context) -- derived, machine-local, re-copy
+# from motif/l2/phmm_l2.pkl and ../audio/noise_collection/naive_noise.wav
+# to refresh.
+serverless/runpod_worker/assets/

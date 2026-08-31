@@ -66,16 +66,30 @@ Besides the model pickle and metrics.csv, `train` also writes:
 
 `find` writes:
   - motif_hits.csv: one row per detected motif occurrence (which
-    sub-model, start/stop in samples and seconds, length in frames).
-  - submodel_<n>_hits.wav: written per sub-model id (raw audio of every
-    hit for it concatenated back to back), then always deleted right
-    after -- motif_hits.csv has everything needed to re-derive them
-    from the source wav, so they aren't kept around.
-  - embeddings.pkl: cached whole-file embedding, since embedding a
-    large recording end to end is the slow part here (no candidates.pkl
-    equivalent to reuse -- this is a continuous scan, not per-candidate
-    slices) and you'll often want to try more than one model against
-    the same target file.
+    sub-model, start/stop in samples and seconds, length in frames,
+    mean_emission_score/mean_noise_score/mean_llr_score,
+    classification/classification_confidence -- see
+    extract_motif_segments()). mean_noise_score/mean_llr_score are only
+    populated when --noise-wav is given; classification/
+    classification_confidence come from the Whisper model's own
+    BURST/ECHO/UP/DOWN/NOISE classifier head (majority vote + agreement
+    fraction over the hit's matched frames), always populated.
+  - submodel_<n>_hits.wav: one file per sub-model id, the raw audio of
+    every hit for it concatenated back to back, with --hit-gap-seconds
+    of silence between consecutive hits (default 0.5s) so occurrence
+    boundaries are audible/visible instead of every hit running
+    seamlessly into the next. Any submodel_*_hits.wav left in
+    output_path from a prior find run against the same output_path is
+    cleared first, so re-running (e.g. against cached embeddings.pkl
+    with different --noise-* settings) doesn't mix stale clips from the
+    old run with fresh ones.
+  - embeddings.pkl: cached (embeddings, classifications, step_samples)
+    for the whole file, since embedding a large recording end to end is
+    the slow part here (no candidates.pkl equivalent to reuse -- this is
+    a continuous scan, not per-candidate slices) and you'll often want
+    to try more than one model against the same target file. A cache
+    written before classifications were added is a 2-tuple and won't
+    unpack against this -- delete it to force a recompute.
 
 Usage:
     python motif_discovery.py train L2.csv L2.wav output_dir
@@ -90,6 +104,7 @@ import random
 import time
 import wave
 import pickle as pkl
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -294,7 +309,7 @@ def assign_submodels(paths, n_states):
     return assignments
 
 
-def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, suffix=""):
+def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, suffix="", gap_seconds=0.0):
     """
     One submodel_<n><suffix>.wav per sub-model id: the raw audio of
     every (span, submodel_id) pair assigned to it, concatenated back to
@@ -305,15 +320,29 @@ def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, s
     Re-loads/filters the source wav rather than reusing an
     already-loaded one, since the caller's embeddings may have come
     from a pkl cache this run.
+
+    gap_seconds > 0 inserts that much digital silence between
+    consecutive clips (none before the first or after the last) so
+    where one hit ends and the next begins is audible/visible in a
+    waveform view, instead of every occurrence running seamlessly into
+    the next. Default 0.0 keeps clips back to back, unchanged.
     """
     waveform, sr = load_filtered_waveform(wav_path)
     n_samples = waveform.shape[1]
+    gap_samples = int(round(gap_seconds * sr))
+    gap = torch.zeros((waveform.shape[0], gap_samples)) if gap_samples > 0 else None
     for n in range(n_models):
         idxs = [i for i, sid in enumerate(submodel_ids) if sid == n]
         if not idxs:
             print(f"  submodel {n}: nothing assigned, skipping audio export")
             continue
         clips = [waveform[:, spans[i][0]:min(spans[i][1], n_samples)] for i in idxs]
+        if gap is not None:
+            interleaved = [clips[0]]
+            for clip in clips[1:]:
+                interleaved.append(gap)
+                interleaved.append(clip)
+            clips = interleaved
         concatenated = torch.cat(clips, dim=1)
         out_file = output_path / f"submodel_{n}{suffix}.wav"
         torchaudio.save(str(out_file), concatenated, sr)
@@ -329,9 +358,18 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
     Embed an entire (potentially long) recording via the same sliding
     window as load_candidates(), but continuously across the whole file
     instead of per-candidate slices -- for `find`, not `train`. Returns
-    (embeddings, step_samples): an (n_windows, D) array and the sample
-    hop between windows, needed to convert frame indices in a Viterbi
-    path back to sample offsets.
+    (embeddings, classifications, step_samples): an (n_windows, D) array,
+    a parallel list of per-window BURST/ECHO/UP/DOWN/NOISE labels (see
+    lib_phmm.signals.classify()/LABEL_MAP), and the sample hop between
+    windows, needed to convert frame indices in a Viterbi path back to
+    sample offsets.
+
+    model.forward() already computes both outputs from the same pass
+    over each window (see WDPWhisperEmbModelV2.forward() in
+    lib_phmm/model.py) -- classifications used to be dropped on the
+    floor here, so re-deriving them for an already-embedded recording
+    meant re-running the model over its audio all over again. Capturing
+    them alongside embeddings on this same pass costs nothing extra.
     """
     waveform, sr = load_filtered_waveform(wav_path)
     step_samples = CONFIG['window_size_samples'] // CONFIG['step_denominator']
@@ -341,9 +379,11 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
         log_every = max(1, n_expected // 20)
 
     raw_embeddings = []
+    classifications = []
     start_time = time.time() if verbose else None
     for i, result in enumerate(process(waveform, model, processor)):
         raw_embeddings.append(result['embeddings'])
+        classifications.append(classify(result['classifications']))
         if verbose and ((i + 1) % log_every == 0 or i + 1 == n_expected):
             elapsed = time.time() - start_time
             rate = (i + 1) / elapsed if elapsed > 0 else 0.0
@@ -353,13 +393,14 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
 
     embeddings = np.array(raw_embeddings)
     embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
-    return embeddings, step_samples
+    return embeddings, classifications, step_samples
 
 
-def extract_motif_segments(path, hmm, n_states, embeddings):
+def extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=None, classifications=None):
     """
     Walk a Viterbi path and return (start_frame, stop_frame, submodel,
-    mean_score) for each contiguous B..E domain -- one entry per
+    mean_score, mean_noise_score, mean_llr_score, majority_class,
+    majority_fraction) for each contiguous B..E domain -- one entry per
     detected motif occurrence. Frame indices are into the decoded
     embedding sequence; multiply by embed_full_file()'s step_samples to
     get sample offsets.
@@ -372,21 +413,56 @@ def extract_motif_segments(path, hmm, n_states, embeddings):
     loop-back bias let through on transition-prior cheapness alone
     rather than genuine acoustic similarity.
 
+    mean_noise_score/mean_llr_score are only populated when noise_pdf is
+    given (the --noise-wav mixture model, see build_noise_model()) --
+    None otherwise. mean_noise_score is the same matched frames' mean
+    log2-likelihood under noise_pdf instead of the match states.
+    mean_llr_score is mean_score - mean_noise_score: since both are
+    log2-likelihoods, their difference is the log2 likelihood ratio
+    motif-vs-noise (log(P_match/P_noise), base 2) -- positive means the
+    segment fits the motif model better than background even after
+    accounting for how plausible that stretch of audio is as noise,
+    which mean_score alone can't tell you (a low mean_score can still
+    beat an even-lower-likelihood noise stretch, or a high mean_score
+    can be unremarkable if that region is generically easy to score high
+    under noise too).
+
+    majority_class/majority_fraction are only populated when
+    classifications is given (embed_full_file()'s per-window
+    BURST/ECHO/UP/DOWN/NOISE labels, aligned frame-for-frame with
+    embeddings) -- None otherwise. majority_class is the most common
+    label among the segment's matched frames (collections.Counter over
+    classifications[step.time] for each matched frame); majority_fraction
+    is that count divided by the segment's frame count, i.e. how
+    internally consistent the segment's classification is (1.0 = every
+    frame agreed).
+
     Segment-tracking logic adapted from
     lib_phmm.visualization.extract_match_wav, stripped of the
     audio-reconstruction machinery that function also does for
-    plotting -- not needed here, this only wants the spans (+ score).
+    plotting -- not needed here, this only wants the spans (+ scores).
     """
     segments = []
-    seg_start, seg_stop, seg_model, seg_scores = None, None, None, []
+    seg_start, seg_stop, seg_model, seg_scores, seg_noise_scores, seg_classes = None, None, None, [], [], []
     for step in path:
         if step.state == phmm.B:
-            seg_start, seg_stop, seg_model, seg_scores = None, None, None, []
+            seg_start, seg_stop, seg_model, seg_scores, seg_noise_scores, seg_classes = None, None, None, [], [], []
         elif step.state == phmm.E:
             if seg_start is not None:
                 mean_score = sum(seg_scores) / len(seg_scores)
-                segments.append((seg_start, seg_stop, seg_model, mean_score))
-            seg_start, seg_stop, seg_model, seg_scores = None, None, None, []
+                if noise_pdf is not None:
+                    mean_noise_score = sum(seg_noise_scores) / len(seg_noise_scores)
+                    mean_llr_score = mean_score - mean_noise_score
+                else:
+                    mean_noise_score, mean_llr_score = None, None
+                if classifications is not None:
+                    label, count = Counter(seg_classes).most_common(1)[0]
+                    majority_class, majority_fraction = label, count / len(seg_classes)
+                else:
+                    majority_class, majority_fraction = None, None
+                segments.append((seg_start, seg_stop, seg_model, mean_score, mean_noise_score, mean_llr_score,
+                                  majority_class, majority_fraction))
+            seg_start, seg_stop, seg_model, seg_scores, seg_noise_scores, seg_classes = None, None, None, [], [], []
         elif step.state >= phmm.MATCH_STATE:
             idx = step.state - phmm.MATCH_STATE
             n, k = idx // n_states, idx % n_states
@@ -395,6 +471,10 @@ def extract_motif_segments(path, hmm, n_states, embeddings):
                 seg_model = n
             seg_stop = step.time
             seg_scores.append(hmm.pdf[n][k].ll(embeddings[step.time]) / math.log(2.0))
+            if noise_pdf is not None:
+                seg_noise_scores.append(noise_pdf.ll(embeddings[step.time]) / math.log(2.0))
+            if classifications is not None:
+                seg_classes.append(classifications[step.time])
     return segments
 
 
@@ -659,7 +739,11 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
     else:
         whisper_model = whisper_model_v2()
         processor     = whisper_processor()
-        embeddings, step_samples = embed_full_file(noise_wav_path, whisper_model, processor, verbose=verbose)
+        # noise model only fits a Gaussian/GMM over embeddings -- per-window
+        # classifications aren't needed here (unlike find_in_file's
+        # embeddings.pkl), so they're computed (free, same forward pass)
+        # but not cached.
+        embeddings, _, step_samples = embed_full_file(noise_wav_path, whisper_model, processor, verbose=verbose)
         with open(embeddings_path, "wb") as f:
             pkl.dump((embeddings, step_samples), f)
     print(f"Noise model fit from {len(embeddings)} windows of {noise_wav_path}")
@@ -694,13 +778,12 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
     return phmm.MixtureModel(components, log_weights)
 
 
-def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False):
+def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False, hit_gap_seconds=0.5):
     """
     Search one recording for hmm's motifs: embed it (cached to
     embeddings.pkl under output_path), Viterbi-decode in one pass, and
-    write motif_hits.csv under output_path (submodel_<n>_hits.wav clips
-    are written then immediately deleted -- see write_submodel_audio()
-    call below).
+    write motif_hits.csv + submodel_<n>_hits.wav under output_path,
+    clearing any submodel_*_hits.wav left there from a prior run first.
     Returns the segments found (see extract_motif_segments()).
     """
     output_path.mkdir(parents=True, exist_ok=True)
@@ -711,14 +794,14 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     embeddings_path = output_path / "embeddings.pkl"
     if embeddings_path.exists():
         with open(embeddings_path, "rb") as f:
-            embeddings, step_samples = pkl.load(f)
+            embeddings, classifications, step_samples = pkl.load(f)
         print(f"Loaded cached embeddings from: {embeddings_path}")
     else:
         whisper_model = whisper_model_v2()
         processor     = whisper_processor()
-        embeddings, step_samples = embed_full_file(wav_path, whisper_model, processor, verbose=verbose)
+        embeddings, classifications, step_samples = embed_full_file(wav_path, whisper_model, processor, verbose=verbose)
         with open(embeddings_path, "wb") as f:
-            pkl.dump((embeddings, step_samples), f)
+            pkl.dump((embeddings, classifications, step_samples), f)
     print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop)")
 
     print("==========================================")
@@ -727,12 +810,17 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     score, path = phmm.viterbi(embeddings, hmm, noise_pdf)
     print(f"Viterbi score: {score:.1f}")
 
-    segments = extract_motif_segments(path, hmm, n_states, embeddings)
+    segments = extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=noise_pdf,
+                                       classifications=classifications)
     print(f"Found {len(segments)} motif occurrences")
 
-    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _, _ in segments]
-    hit_submodel_ids = [model for _, _, model, _ in segments]
-    hit_scores = [score for _, _, _, score in segments]
+    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _, _, _, _, _, _ in segments]
+    hit_submodel_ids = [model for _, _, model, _, _, _, _, _ in segments]
+    hit_scores = [score for _, _, _, score, _, _, _, _ in segments]
+    hit_noise_scores = [noise_score for _, _, _, _, noise_score, _, _, _ in segments]
+    hit_llr_scores = [llr_score for _, _, _, _, _, llr_score, _, _ in segments]
+    hit_classes = [cls for _, _, _, _, _, _, cls, _ in segments]
+    hit_class_confidences = [conf for _, _, _, _, _, _, _, conf in segments]
 
     print("==========================================")
     print("Motif search: writing hits                 ")
@@ -744,8 +832,12 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
         "stop_sample": [e for _, e in hit_spans],
         "start_time_s": [s / CONFIG['sampling_rate'] for s, _ in hit_spans],
         "stop_time_s": [e / CONFIG['sampling_rate'] for _, e in hit_spans],
-        "n_frames": [stop - start + 1 for start, stop, _, _ in segments],
+        "n_frames": [stop - start + 1 for start, stop, _, _, _, _, _, _ in segments],
         "mean_emission_score": hit_scores,
+        "mean_noise_score": hit_noise_scores,
+        "mean_llr_score": hit_llr_scores,
+        "classification": hit_classes,
+        "classification_confidence": hit_class_confidences,
     })
     hits_path = output_path / "motif_hits.csv"
     hits_df.to_csv(hits_path, index=False)
@@ -754,17 +846,20 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     print("==========================================")
     print("Motif search: per-submodel hit audio       ")
     print("==========================================")
+    # Clear any submodel_<n>_hits.wav left from a prior run in this same
+    # output_path before writing this run's clips -- e.g. re-running find
+    # against cached embeddings.pkl with a different --noise-var-scale
+    # would otherwise mix stale and fresh clips under the same names/ids
+    # with no way to tell them apart. This run's clips are kept (not
+    # deleted after writing).
+    stale_hit_wavs = sorted(output_path.glob("submodel_*_hits.wav"))
+    for f in stale_hit_wavs:
+        f.unlink()
+    if stale_hit_wavs:
+        print(f"  cleared {len(stale_hit_wavs)} submodel_*_hits.wav file(s) from a prior run")
     if segments:
-        write_submodel_audio(wav_path, hit_spans, hit_submodel_ids, n_models, output_path, suffix="_hits")
-        # find's submodel_<n>_hits.wav clips are useful for a quick listen
-        # right after this run but aren't kept long-term (motif_hits.csv
-        # has everything needed to re-derive them from the source wav) --
-        # always delete them once written, unlike train's plain
-        # submodel_<n>.wav (no suffix), which stays.
-        hit_wav_files = sorted(output_path.glob("submodel_*_hits.wav"))
-        for f in hit_wav_files:
-            f.unlink()
-        print(f"  deleted {len(hit_wav_files)} submodel_*_hits.wav file(s)")
+        write_submodel_audio(wav_path, hit_spans, hit_submodel_ids, n_models, output_path,
+                              suffix="_hits", gap_seconds=hit_gap_seconds)
     else:
         print("  no hits, nothing to export")
 
@@ -815,10 +910,11 @@ def run_find(args):
             print(f"[{i + 1}/{len(wav_files)}] {wav_file.name}")
             print("==========================================")
             find_in_file(wav_file, output_path / wav_file.stem, hmm, n_states, n_models,
-                         noise_pdf=noise_pdf, verbose=args.verbose)
+                         noise_pdf=noise_pdf, verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds)
     else:
         output_path.mkdir(parents=True, exist_ok=True)
-        find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=noise_pdf, verbose=args.verbose)
+        find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=noise_pdf,
+                     verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds)
 
     print("==========================================")
     print("Done")
@@ -848,7 +944,7 @@ if __name__ == "__main__":
     find_parser = subparsers.add_parser("find", help="search a fitted model's motifs in a (potentially large) recording")
     find_parser.add_argument("model_path", help="model pickle produced by `train` (e.g. output_dir/phmm_l2.pkl)")
     find_parser.add_argument("wav_path", help="recording to search for motifs, or a directory of .wav files to search each of independently (one output_path/<wav stem>/ subfolder per file)")
-    find_parser.add_argument("output_path", help="output directory for motif_hits.csv and embeddings.pkl cache (submodel_<n>_hits.wav clips are written per sub-model then always deleted right after -- not kept)")
+    find_parser.add_argument("output_path", help="output directory for motif_hits.csv, embeddings.pkl cache, and submodel_<n>_hits.wav (any submodel_*_hits.wav left here from a prior find run against this output_path is cleared before this run's clips are written)")
     find_parser.add_argument("--verbose", action="store_true", help="log progress while embedding the target file")
     find_parser.add_argument("--repeat-prob", type=float, default=0.999, help="probability of looping back (E->J->B) to keep scanning for another occurrence after a hit, instead of exiting to background forever (E->C, a dead end in this topology) -- overrides the trained ec/ej, which come from single-occurrence training candidates and are unusable for scanning a long file as-is (see run_find()'s comment). Default strongly favors continuing to scan.")
     find_parser.add_argument("--gap-dwell-frames", type=float, default=100.0, help="expected background gap (in frames) the model should tolerate between two motif occurrences before giving up on finding another one nearby -- overrides jj/jb, hardcoded elsewhere to a ~1-frame dwell (fine within training, unusable for scanning a file with real gaps between hits). Generous default: underestimating this risks missing real hits, overestimating mainly costs a bit of false-positive risk once inside a real match.")
@@ -856,6 +952,7 @@ if __name__ == "__main__":
     find_parser.add_argument("--noise-components", type=int, default=None, help="number of Gaussian components (k) for the --noise-wav mixture model. Omit for a single Gaussian fit directly (mean/var, no EM) -- the default. Otherwise fits sklearn.mixture.GaussianMixture(n_components=k) with exactly k components, or -- with --noise-bayesian -- BayesianGaussianMixture using k as an upper bound instead of an exact count. Ignored if --noise-wav isn't set.")
     find_parser.add_argument("--noise-bayesian", action="store_true", help="use sklearn.mixture.BayesianGaussianMixture (Dirichlet process prior) instead of a plain GaussianMixture for --noise-components -- its own weight-concentration prior drives unneeded components' weights toward ~0 on its own, so --noise-components acts as an upper bound rather than a count you have to get exactly right. Requires --noise-components (used as that upper bound).")
     find_parser.add_argument("--noise-var-scale", type=float, default=1.0, help="multiply every fitted noise-model covariance (after the var_floor clamp) by this factor. >1 widens the noise Gaussians so background scores competitively against match states over a larger region of embedding space -- a quick way to fight motif segments bleeding into noise without collecting more/broader --noise-wav recordings. Too high starts eating real motif frames into background instead. Default 1.0 (no change). Ignored if --noise-wav isn't set.")
+    find_parser.add_argument("--hit-gap-seconds", type=float, default=0.5, help="digital silence (in seconds) inserted between consecutive hits when concatenating each submodel_<n>_hits.wav clip, so occurrence boundaries are audible/visible in a waveform view instead of every hit running seamlessly into the next. 0 disables the gap (old back-to-back behavior).")
 
     args = parser.parse_args()
     if args.mode == "train":

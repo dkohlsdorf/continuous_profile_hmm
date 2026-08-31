@@ -1,0 +1,9 @@
+# torch/torchaudio/torchvision are installed separately in the Dockerfile,
+# pinned against the cu128 index (see Dockerfile comment) -- not listed here.
+numpy==1.26.4
+pandas>=2.0.0
+joblib
+transformers==4.54.0
+peft==0.16.0
+pybind11==3.0.0
+scikit-learn
