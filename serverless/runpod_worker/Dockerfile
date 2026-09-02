@@ -70,6 +70,12 @@ COPY model/wdp_whisper_emb_model_L2.pt ./model/wdp_whisper_emb_model_L2.pt
 COPY serverless/runpod_worker/assets/phmm_l2.pkl ./motif/l2/phmm_l2.pkl
 COPY serverless/runpod_worker/assets/naive_noise.wav ./assets/naive_noise.wav
 
+# Records the rate the model was trained at, read back by find to resample
+# both search and noise audio to match (see load_training_sample_rate() in
+# motif_discovery.py). `train` writes this next to the model it produces;
+# it's staged here because the packaged phmm_l2.pkl predates that.
+COPY serverless/runpod_worker/assets/training_metadata.json ./motif/l2/training_metadata.json
+
 COPY serverless/runpod_worker/handler.py .
 
 RUN mkdir -p /app/work

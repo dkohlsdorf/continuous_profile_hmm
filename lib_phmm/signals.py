@@ -31,7 +31,7 @@ def load_file(filename, model, processor, motif_mode=False):
     waveform, _ = load_filtered_waveform(filename)
     results     = [result for result in process(waveform, model, processor)]    
     
-    embeddings = [r['embeddings'] for r in results]
+    embeddings = [r['embeddings'].detach().cpu().numpy() for r in results]
     embeddings = np.array(embeddings)
     embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
     

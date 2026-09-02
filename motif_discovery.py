@@ -68,12 +68,16 @@ Besides the model pickle and metrics.csv, `train` also writes:
   - motif_hits.csv: one row per detected motif occurrence (which
     sub-model, start/stop in samples and seconds, length in frames,
     mean_emission_score/mean_noise_score/mean_llr_score,
-    classification/classification_confidence -- see
+    classification/classification_confidence/whistle_direction -- see
     extract_motif_segments()). mean_noise_score/mean_llr_score are only
     populated when --noise-wav is given; classification/
     classification_confidence come from the Whisper model's own
-    BURST/ECHO/UP/DOWN/NOISE classifier head (majority vote + agreement
-    fraction over the hit's matched frames), always populated.
+    classifier head (majority vote + agreement fraction over the hit's
+    matched frames, always populated) -- BURST/ECHO/WHISTLE/NOISE, with
+    the model's raw UP/DOWN labels pooled into WHISTLE since a real
+    whistle's frames legitimately split between the two. whistle_direction
+    (UP/DOWN/mixed) recovers that split, populated only when
+    classification is WHISTLE.
   - submodel_<n>_hits.wav: one file per sub-model id, the raw audio of
     every hit for it concatenated back to back, with --hit-gap-seconds
     of silence between consecutive hits (default 0.5s) so occurrence
@@ -180,7 +184,7 @@ def load_candidates(csv_path, wav_path, model, processor, verbose=False, log_eve
     for i, (start, stop) in enumerate(spans):
         clip = waveform[:, start:stop]
         results = list(process(clip, model, processor))
-        embeddings = np.array([r['embeddings'] for r in results])
+        embeddings = np.array([r['embeddings'].detach().cpu().numpy() for r in results])
         embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
         classifications = [classify(r['classifications']) for r in results]
         # region embeddings and the sequence to decode are the same array
@@ -309,7 +313,8 @@ def assign_submodels(paths, n_states):
     return assignments
 
 
-def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, suffix="", gap_seconds=0.0):
+def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, suffix="",
+                          gap_seconds=0.0, target_sample_rate=None):
     """
     One submodel_<n><suffix>.wav per sub-model id: the raw audio of
     every (span, submodel_id) pair assigned to it, concatenated back to
@@ -326,8 +331,14 @@ def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, s
     where one hit ends and the next begins is audible/visible in a
     waveform view, instead of every occurrence running seamlessly into
     the next. Default 0.0 keeps clips back to back, unchanged.
+
+    target_sample_rate MUST match whatever the caller's spans were
+    computed in (find resamples to the model's training rate before
+    embedding, so its spans are in that domain) -- reloading at the
+    source rate here would slice at offsets scaled by the rate ratio and
+    export the wrong audio.
     """
-    waveform, sr = load_filtered_waveform(wav_path)
+    waveform, sr = load_waveform_at(wav_path, target_sample_rate)
     n_samples = waveform.shape[1]
     gap_samples = int(round(gap_seconds * sr))
     gap = torch.zeros((waveform.shape[0], gap_samples)) if gap_samples > 0 else None
@@ -353,16 +364,90 @@ def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, s
         print(f"  {n_unassigned} had no match-state visits (submodel_id=-1), excluded from audio export")
 
 
-def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
+TRAINING_METADATA_NAME = "training_metadata.json"
+
+
+def training_metadata_path(model_path):
+    """Sidecar sitting next to a model pickle, written by `train`."""
+    return Path(model_path).parent / TRAINING_METADATA_NAME
+
+
+def save_training_metadata(output_path, sample_rate, wav_path):
+    """
+    Record what `train` actually ran on, next to the model it produced.
+
+    The sample rate is the load-bearing part: nothing in this pipeline
+    resamples on its own, and process() hands raw native-rate samples to
+    the Whisper feature extractor while declaring CONFIG['sampling_rate'],
+    so the model only ever sees audio the way its training data sounded.
+    Searching a recording at a different rate silently shifts it in
+    pitch/time relative to everything the model learned. Persisting the
+    rate here lets find resample to match instead of hardcoding it.
+    """
+    meta = {
+        "sample_rate": int(sample_rate),
+        "trained_from": str(wav_path),
+        "written_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    path = Path(output_path) / TRAINING_METADATA_NAME
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Wrote training metadata ({sample_rate} Hz) to: {path}")
+
+
+def load_training_sample_rate(model_path):
+    """
+    The rate the model at model_path was trained at, or None if the sidecar
+    is missing (models produced before it existed). None means "don't
+    resample" -- the old behaviour, which is right only when the search
+    audio already happens to match the training rate.
+    """
+    path = training_metadata_path(model_path)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return int(json.load(f)["sample_rate"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"WARNING: could not read {path} ({e}) -- not resampling")
+        return None
+
+
+def load_waveform_at(wav_path, target_sample_rate=None):
+    """
+    load_filtered_waveform() plus an optional resample to
+    target_sample_rate, returning (waveform, effective_sample_rate).
+
+    Every consumer of a waveform in `find` goes through this so the
+    embeddings, the frame->sample arithmetic, and the exported hit audio
+    all live in one consistent sample-rate domain. Resampling after the
+    band-pass is fine: the filter's corners are specified in Hz and were
+    applied correctly at the source rate.
+    """
+    waveform, sr = load_filtered_waveform(wav_path)
+    if target_sample_rate is not None and sr != target_sample_rate:
+        waveform = torchaudio.functional.resample(waveform, sr, target_sample_rate)
+        sr = target_sample_rate
+    return waveform, sr
+
+
+def embed_full_file(wav_path, model, processor, verbose=False, log_every=None, target_sample_rate=None):
     """
     Embed an entire (potentially long) recording via the same sliding
     window as load_candidates(), but continuously across the whole file
     instead of per-candidate slices -- for `find`, not `train`. Returns
-    (embeddings, classifications, step_samples): an (n_windows, D) array,
-    a parallel list of per-window BURST/ECHO/UP/DOWN/NOISE labels (see
-    lib_phmm.signals.classify()/LABEL_MAP), and the sample hop between
-    windows, needed to convert frame indices in a Viterbi path back to
-    sample offsets.
+    (embeddings, classifications, step_samples, sample_rate): an
+    (n_windows, D) array, a parallel list of per-window
+    BURST/ECHO/UP/DOWN/NOISE labels (see lib_phmm.signals.classify()/
+    LABEL_MAP), the sample hop between windows (needed to convert frame
+    indices in a Viterbi path back to sample offsets), and the sample rate
+    those offsets are in.
+
+    sample_rate is the file's own rate, or target_sample_rate when
+    resampling to it (see load_waveform_at()). It is NOT
+    CONFIG['sampling_rate']: converting offsets to seconds with that (as
+    this used to) reports times scaled by actual_rate/16000 -- e.g. 3x too
+    long for a 48kHz recording.
 
     model.forward() already computes both outputs from the same pass
     over each window (see WDPWhisperEmbModelV2.forward() in
@@ -371,7 +456,7 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
     meant re-running the model over its audio all over again. Capturing
     them alongside embeddings on this same pass costs nothing extra.
     """
-    waveform, sr = load_filtered_waveform(wav_path)
+    waveform, sr = load_waveform_at(wav_path, target_sample_rate)
     step_samples = CONFIG['window_size_samples'] // CONFIG['step_denominator']
     n_expected = -(-waveform.shape[1] // step_samples)  # ceil division
 
@@ -382,7 +467,7 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
     classifications = []
     start_time = time.time() if verbose else None
     for i, result in enumerate(process(waveform, model, processor)):
-        raw_embeddings.append(result['embeddings'])
+        raw_embeddings.append(result['embeddings'].detach().cpu().numpy())
         classifications.append(classify(result['classifications']))
         if verbose and ((i + 1) % log_every == 0 or i + 1 == n_expected):
             elapsed = time.time() - start_time
@@ -393,17 +478,20 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None):
 
     embeddings = np.array(raw_embeddings)
     embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
-    return embeddings, classifications, step_samples
+    return embeddings, classifications, step_samples, sr
+
+
+WHISTLE_LABEL = 'WHISTLE'
 
 
 def extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=None, classifications=None):
     """
     Walk a Viterbi path and return (start_frame, stop_frame, submodel,
     mean_score, mean_noise_score, mean_llr_score, majority_class,
-    majority_fraction) for each contiguous B..E domain -- one entry per
-    detected motif occurrence. Frame indices are into the decoded
-    embedding sequence; multiply by embed_full_file()'s step_samples to
-    get sample offsets.
+    majority_fraction, whistle_direction) for each contiguous B..E domain
+    -- one entry per detected motif occurrence. Frame indices are into
+    the decoded embedding sequence; multiply by embed_full_file()'s
+    step_samples to get sample offsets.
 
     mean_score is the mean per-frame emission log2-likelihood
     (hmm.pdf[n][k].ll(embeddings[time]), same conversion viterbi() uses
@@ -427,15 +515,24 @@ def extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=None, clas
     can be unremarkable if that region is generically easy to score high
     under noise too).
 
-    majority_class/majority_fraction are only populated when
-    classifications is given (embed_full_file()'s per-window
+    majority_class/majority_fraction/whistle_direction are only populated
+    when classifications is given (embed_full_file()'s per-window
     BURST/ECHO/UP/DOWN/NOISE labels, aligned frame-for-frame with
-    embeddings) -- None otherwise. majority_class is the most common
-    label among the segment's matched frames (collections.Counter over
+    embeddings) -- None otherwise. UP and DOWN are pooled into a single
+    WHISTLE label for the vote: a real whistle sweeps, so its frames
+    legitimately split between UP and DOWN, and voting on the raw labels
+    lets that split cost the segment its majority (e.g. 45% UP/40% DOWN/
+    15% NOISE would report "UP" at only 0.45 confidence, when ~85% of the
+    segment is actually whistle of some direction). majority_class is the
+    most common pooled label (BURST/ECHO/WHISTLE/NOISE) among the
+    segment's matched frames (collections.Counter over
     classifications[step.time] for each matched frame); majority_fraction
     is that count divided by the segment's frame count, i.e. how
     internally consistent the segment's classification is (1.0 = every
-    frame agreed).
+    frame agreed). whistle_direction (UP/DOWN/mixed, else None) is only
+    set when majority_class is WHISTLE -- whichever of the raw UP/DOWN
+    counts was larger, or "mixed" on an exact tie -- so the pooling above
+    doesn't lose direction entirely.
 
     Segment-tracking logic adapted from
     lib_phmm.visualization.extract_match_wav, stripped of the
@@ -456,12 +553,24 @@ def extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=None, clas
                 else:
                     mean_noise_score, mean_llr_score = None, None
                 if classifications is not None:
-                    label, count = Counter(seg_classes).most_common(1)[0]
+                    pooled = [WHISTLE_LABEL if c in ('UP', 'DOWN') else c for c in seg_classes]
+                    label, count = Counter(pooled).most_common(1)[0]
                     majority_class, majority_fraction = label, count / len(seg_classes)
+                    if majority_class == WHISTLE_LABEL:
+                        n_up = sum(1 for c in seg_classes if c == 'UP')
+                        n_down = sum(1 for c in seg_classes if c == 'DOWN')
+                        if n_up > n_down:
+                            whistle_direction = 'UP'
+                        elif n_down > n_up:
+                            whistle_direction = 'DOWN'
+                        else:
+                            whistle_direction = 'mixed'
+                    else:
+                        whistle_direction = None
                 else:
-                    majority_class, majority_fraction = None, None
+                    majority_class, majority_fraction, whistle_direction = None, None, None
                 segments.append((seg_start, seg_stop, seg_model, mean_score, mean_noise_score, mean_llr_score,
-                                  majority_class, majority_fraction))
+                                  majority_class, majority_fraction, whistle_direction))
             seg_start, seg_stop, seg_model, seg_scores, seg_noise_scores, seg_classes = None, None, None, [], [], []
         elif step.state >= phmm.MATCH_STATE:
             idx = step.state - phmm.MATCH_STATE
@@ -486,6 +595,12 @@ def run_train(args):
     model_name = args.model_name or f"phmm_{Path(args.wav_path).stem.lower()}.pkl"
     model_path = output_path / model_name
     model_was_cached = model_path.exists()
+
+    # Written up front (not after the sweep) so it lands even when the model
+    # itself is loaded from cache below -- find needs it either way.
+    with wave.open(str(args.wav_path), 'rb') as _w:
+        training_sample_rate = _w.getframerate()
+    save_training_metadata(output_path, training_sample_rate, args.wav_path)
 
     print("==========================================")
     print("Motif discovery: embedding candidates       ")
@@ -682,7 +797,8 @@ def apply_search_transitions(hmm, repeat_prob, gap_dwell_frames):
 
 
 def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=False,
-                       var_floor=0.1, var_scale=1.0, verbose=False, seed=None):
+                       var_floor=0.1, var_scale=1.0, verbose=False, seed=None,
+                       target_sample_rate=None):
     """
     Ad-hoc "background" emission model for find --noise-wav: a
     MixtureModel fit to the whole file's embeddings. Find-only, never
@@ -743,7 +859,12 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
         # classifications aren't needed here (unlike find_in_file's
         # embeddings.pkl), so they're computed (free, same forward pass)
         # but not cached.
-        embeddings, _, step_samples = embed_full_file(noise_wav_path, whisper_model, processor, verbose=verbose)
+        # Same target rate as the search audio: the noise model is one side
+        # of a likelihood ratio against the match states, so it has to be
+        # fit in the same domain or the comparison is meaningless.
+        embeddings, _, step_samples, _ = embed_full_file(noise_wav_path, whisper_model, processor,
+                                                          verbose=verbose,
+                                                          target_sample_rate=target_sample_rate)
         with open(embeddings_path, "wb") as f:
             pkl.dump((embeddings, step_samples), f)
     print(f"Noise model fit from {len(embeddings)} windows of {noise_wav_path}")
@@ -778,7 +899,8 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
     return phmm.MixtureModel(components, log_weights)
 
 
-def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False, hit_gap_seconds=0.5):
+def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False,
+                  hit_gap_seconds=0.5, target_sample_rate=None):
     """
     Search one recording for hmm's motifs: embed it (cached to
     embeddings.pkl under output_path), Viterbi-decode in one pass, and
@@ -794,15 +916,28 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     embeddings_path = output_path / "embeddings.pkl"
     if embeddings_path.exists():
         with open(embeddings_path, "rb") as f:
-            embeddings, classifications, step_samples = pkl.load(f)
+            embeddings, classifications, step_samples, sample_rate = pkl.load(f)
         print(f"Loaded cached embeddings from: {embeddings_path}")
     else:
         whisper_model = whisper_model_v2()
         processor     = whisper_processor()
-        embeddings, classifications, step_samples = embed_full_file(wav_path, whisper_model, processor, verbose=verbose)
+        embeddings, classifications, step_samples, sample_rate = embed_full_file(
+            wav_path, whisper_model, processor, verbose=verbose,
+            target_sample_rate=target_sample_rate)
         with open(embeddings_path, "wb") as f:
-            pkl.dump((embeddings, classifications, step_samples), f)
-    print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop)")
+            pkl.dump((embeddings, classifications, step_samples, sample_rate), f)
+    print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop, {sample_rate} Hz)")
+    if sample_rate != CONFIG['sampling_rate']:
+        # Nothing in this pipeline resamples: process() hands raw native-rate
+        # samples to the Whisper feature extractor while telling it they're
+        # CONFIG['sampling_rate'], so the model sees the audio pitch/time
+        # -scaled by sample_rate/CONFIG['sampling_rate']. Whatever rate the
+        # model was TRAINED on is the one that has to be matched here --
+        # a mismatch silently degrades every match score.
+        print(f"  WARNING: file is {sample_rate} Hz but CONFIG['sampling_rate'] is "
+              f"{CONFIG['sampling_rate']} Hz and nothing resamples -- Whisper sees this audio "
+              f"scaled by {sample_rate / CONFIG['sampling_rate']:.3g}x. Match quality is only "
+              f"meaningful if the training audio had this same rate.")
 
     print("==========================================")
     print("Motif search: decoding                     ")
@@ -814,13 +949,14 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
                                        classifications=classifications)
     print(f"Found {len(segments)} motif occurrences")
 
-    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _, _, _, _, _, _ in segments]
-    hit_submodel_ids = [model for _, _, model, _, _, _, _, _ in segments]
-    hit_scores = [score for _, _, _, score, _, _, _, _ in segments]
-    hit_noise_scores = [noise_score for _, _, _, _, noise_score, _, _, _ in segments]
-    hit_llr_scores = [llr_score for _, _, _, _, _, llr_score, _, _ in segments]
-    hit_classes = [cls for _, _, _, _, _, _, cls, _ in segments]
-    hit_class_confidences = [conf for _, _, _, _, _, _, _, conf in segments]
+    hit_spans = [(start * step_samples, (stop + 1) * step_samples) for start, stop, _, _, _, _, _, _, _ in segments]
+    hit_submodel_ids = [model for _, _, model, _, _, _, _, _, _ in segments]
+    hit_scores = [score for _, _, _, score, _, _, _, _, _ in segments]
+    hit_noise_scores = [noise_score for _, _, _, _, noise_score, _, _, _, _ in segments]
+    hit_llr_scores = [llr_score for _, _, _, _, _, llr_score, _, _, _ in segments]
+    hit_classes = [cls for _, _, _, _, _, _, cls, _, _ in segments]
+    hit_class_confidences = [conf for _, _, _, _, _, _, _, conf, _ in segments]
+    hit_whistle_directions = [wd for _, _, _, _, _, _, _, _, wd in segments]
 
     print("==========================================")
     print("Motif search: writing hits                 ")
@@ -830,14 +966,18 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
         "submodel_id": hit_submodel_ids,
         "start_sample": [s for s, _ in hit_spans],
         "stop_sample": [e for _, e in hit_spans],
-        "start_time_s": [s / CONFIG['sampling_rate'] for s, _ in hit_spans],
-        "stop_time_s": [e / CONFIG['sampling_rate'] for _, e in hit_spans],
-        "n_frames": [stop - start + 1 for start, stop, _, _, _, _, _, _ in segments],
+        # sample_rate is the file's real rate, NOT CONFIG['sampling_rate'] --
+        # nothing resamples, so spans are in native samples (see
+        # embed_full_file()).
+        "start_time_s": [s / sample_rate for s, _ in hit_spans],
+        "stop_time_s": [e / sample_rate for _, e in hit_spans],
+        "n_frames": [stop - start + 1 for start, stop, _, _, _, _, _, _, _ in segments],
         "mean_emission_score": hit_scores,
         "mean_noise_score": hit_noise_scores,
         "mean_llr_score": hit_llr_scores,
         "classification": hit_classes,
         "classification_confidence": hit_class_confidences,
+        "whistle_direction": hit_whistle_directions,
     })
     hits_path = output_path / "motif_hits.csv"
     hits_df.to_csv(hits_path, index=False)
@@ -859,7 +999,8 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
         print(f"  cleared {len(stale_hit_wavs)} submodel_*_hits.wav file(s) from a prior run")
     if segments:
         write_submodel_audio(wav_path, hit_spans, hit_submodel_ids, n_models, output_path,
-                              suffix="_hits", gap_seconds=hit_gap_seconds)
+                              suffix="_hits", gap_seconds=hit_gap_seconds,
+                              target_sample_rate=sample_rate)
     else:
         print("  no hits, nothing to export")
 
@@ -880,6 +1021,19 @@ def run_find(args):
 
     apply_search_transitions(hmm, args.repeat_prob, args.gap_dwell_frames)
 
+    # Resample search + noise audio to whatever rate this model was trained
+    # at, recorded by `train` next to the model. Nothing else resamples, so
+    # a rate mismatch here silently shifts every recording in pitch/time
+    # relative to the model's training data. None (no sidecar, e.g. a model
+    # from before this existed) keeps the old no-resample behaviour.
+    target_sample_rate = args.resample_hz or load_training_sample_rate(args.model_path)
+    if target_sample_rate:
+        print(f"Resampling audio to the model's training rate: {target_sample_rate} Hz")
+    else:
+        print(f"WARNING: no {TRAINING_METADATA_NAME} next to {args.model_path} and no "
+              f"--resample-hz -- audio is used at its own rate, which is only correct if "
+              f"it already matches whatever the model was trained on.")
+
     output_path = Path(args.output_path)
     wav_path = Path(args.wav_path)
 
@@ -893,7 +1047,8 @@ def run_find(args):
         print("==========================================")
         noise_pdf = build_noise_model(Path(args.noise_wav), output_path,
                                        n_components=args.noise_components, bayesian=args.noise_bayesian,
-                                       var_scale=args.noise_var_scale, verbose=args.verbose)
+                                       var_scale=args.noise_var_scale, verbose=args.verbose,
+                                       target_sample_rate=target_sample_rate)
 
     if wav_path.is_dir():
         wav_files = sorted(wav_path.glob("*.wav"))
@@ -910,11 +1065,13 @@ def run_find(args):
             print(f"[{i + 1}/{len(wav_files)}] {wav_file.name}")
             print("==========================================")
             find_in_file(wav_file, output_path / wav_file.stem, hmm, n_states, n_models,
-                         noise_pdf=noise_pdf, verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds)
+                         noise_pdf=noise_pdf, verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds,
+                         target_sample_rate=target_sample_rate)
     else:
         output_path.mkdir(parents=True, exist_ok=True)
         find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=noise_pdf,
-                     verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds)
+                     verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds,
+                     target_sample_rate=target_sample_rate)
 
     print("==========================================")
     print("Done")
@@ -953,6 +1110,7 @@ if __name__ == "__main__":
     find_parser.add_argument("--noise-bayesian", action="store_true", help="use sklearn.mixture.BayesianGaussianMixture (Dirichlet process prior) instead of a plain GaussianMixture for --noise-components -- its own weight-concentration prior drives unneeded components' weights toward ~0 on its own, so --noise-components acts as an upper bound rather than a count you have to get exactly right. Requires --noise-components (used as that upper bound).")
     find_parser.add_argument("--noise-var-scale", type=float, default=1.0, help="multiply every fitted noise-model covariance (after the var_floor clamp) by this factor. >1 widens the noise Gaussians so background scores competitively against match states over a larger region of embedding space -- a quick way to fight motif segments bleeding into noise without collecting more/broader --noise-wav recordings. Too high starts eating real motif frames into background instead. Default 1.0 (no change). Ignored if --noise-wav isn't set.")
     find_parser.add_argument("--hit-gap-seconds", type=float, default=0.5, help="digital silence (in seconds) inserted between consecutive hits when concatenating each submodel_<n>_hits.wav clip, so occurrence boundaries are audible/visible in a waveform view instead of every hit running seamlessly into the next. 0 disables the gap (old back-to-back behavior).")
+    find_parser.add_argument("--resample-hz", type=int, default=None, help=f"resample search and --noise-wav audio to this rate before embedding. Normally you don't pass this: the rate is read from {TRAINING_METADATA_NAME} next to the model, written by `train`, so it matches whatever that model was trained on. Nothing else in the pipeline resamples -- process() hands raw native-rate samples to the Whisper feature extractor while declaring CONFIG['sampling_rate'] -- so searching audio at a rate the model wasn't trained on silently shifts it in pitch/time and degrades every match. Use this only to override the sidecar, or for a model that predates it.")
 
     args = parser.parse_args()
     if args.mode == "train":
