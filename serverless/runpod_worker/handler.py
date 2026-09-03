@@ -93,8 +93,11 @@ NOISE_WAV_PATH = "/app/assets/naive_noise.wav"
 # embeddings.pkl goes to the persistent Drive cache folder instead (see
 # EMBEDDINGS_CACHE_FOLDER_NAME), not into the timestamped results folder --
 # a results folder is per-run, so a copy there could never be found again
-# by a later run looking to skip decoding.
-UPLOAD_SKIP_NAMES = {"embeddings.pkl"}
+# by a later run looking to skip decoding. noise_embeddings.pkl is
+# find_in_file()'s own same-run cache for the packaged --noise-wav (see
+# motif_discovery.py's build_noise_model() docstring) -- meaningless
+# outside this container, since assets/naive_noise.wav isn't on Drive.
+UPLOAD_SKIP_NAMES = {"embeddings.pkl", "noise_embeddings.pkl"}
 
 # Persistent (NOT per-run/timestamped) Drive folder holding one
 # <recording stem>.pkl per already-embedded recording, so a later run over

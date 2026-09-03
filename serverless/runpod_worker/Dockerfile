@@ -12,6 +12,22 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
+# process() in lib_phmm/signals.py calls the CPU-side Whisper feature
+# extractor once per 5120-sample window -- tens of thousands of times for
+# a long recording (a 75,259-window file was observed OOM-killed, return
+# code -9, on a MIG-sliced pod). Left unset, OpenBLAS/OMP/MKL each size
+# their thread pool to every visible core on the host CPU (an EPYC 9554,
+# 64c/128t), so a workload of many tiny per-window calls spends its time
+# spinning up/tearing down huge thread pools instead of the ~0.1s of real
+# work each one does -- glibc's per-thread malloc arenas are a well-known
+# way for that churn to bloat RSS over exactly this many iterations,
+# unrelated to actual data volume (the embeddings list itself is tiny:
+# 75,259 x (1,128) float32 is ~38MB). Capped here since it's a container-
+# wide setting these libraries only read once, at first use.
+ENV OMP_NUM_THREADS=4
+ENV MKL_NUM_THREADS=4
+ENV OPENBLAS_NUM_THREADS=4
+
 WORKDIR /app
 
 # build-essential/g++/gcc: compiling lib_phmm's pybind11 C++ extensions.

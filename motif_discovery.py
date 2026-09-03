@@ -104,6 +104,7 @@ import argparse
 import datetime
 import json
 import math
+import os
 import random
 import time
 import wave
@@ -116,6 +117,18 @@ import pandas as pd
 import torch
 import torchaudio
 from joblib import Parallel, delayed
+
+# lib_phmm.signals.process() calls Whisper's CPU-side feature extractor once
+# per analysis window -- tens of thousands of times for a long recording.
+# Left uncapped, torch/OMP/MKL each size their thread pool to every visible
+# core, so a many-core host turns that into thousands of oversized
+# thread-pool spin-ups for ~0.1s of real work each, which is a well-known
+# way to bloat RSS via glibc's per-thread malloc arenas -- this is what
+# OOM-killed a 75,259-window file on a RunPod worker (return code -9).
+# Reads OMP_NUM_THREADS (set in the serverless Dockerfile) so the container
+# is the single source of truth for the number; defaults to 4 when running
+# outside it, e.g. locally.
+torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
