@@ -156,8 +156,12 @@ PYBIND11_MODULE(profile_hmm, m) {
 
   m.def("viterbi", &viterbi,
         py::arg("sequence"), py::arg("phmm"), py::arg("noise_pdf") = py::none(),
+        py::arg("require_full_match") = false,
         "Run Viterbi decoding. Returns (log2_score, path) where path is a list of Pred. "
         "noise_pdf: optional MixtureModel giving N/J/C a real emission model (competing "
         "against match states) instead of the default silent/transition-only behavior "
-        "-- see profile_hmm.hpp's viterbi() comment.");
+        "-- see profile_hmm.hpp's viterbi() comment. "
+        "require_full_match: if True, a match must run a submodel's complete state chain "
+        "start to true end -- default (False) allows entering/exiting at any interior "
+        "match state, i.e. partial matches.");
 }

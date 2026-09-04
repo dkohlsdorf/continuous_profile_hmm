@@ -230,16 +230,40 @@ inline string state_name(int state, int n_models, int match_state_per_model) {
 }
 
 
+// require_full_match: forces every match to run a submodel's complete
+// state chain, start to true end, instead of the default (false) which
+// lets Viterbi enter/exit at any interior match state -- see the two
+// guards below. Doesn't affect self-transitions (mm): a path can still
+// dwell arbitrarily long on any one state, since that's time-stretching
+// the same aligned position, not skipping past it.
 inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
-                                           optional<MixtureModel> noise_pdf = nullopt) {
+                                           optional<MixtureModel> noise_pdf = nullopt,
+                                           bool require_full_match = false) {
   int n_models = phmm.pdf.size();
   int match_state_per_model = phmm.pdf[0].size();
   int n_states = match_state_per_model * n_models + MATCH_STATE;
   int length = sequence.size();
+  int last_match_index = match_state_per_model - 1;
 
   Mat W = zeros(length, n_states);
   vector<vector<Pred>> TB(length, vector<Pred>(n_states, {-1, -1}));
 
+  // Every state other than N/B is unreachable at t=0 (W stays -INFINITY,
+  // its zeros() default) -- but TB[0][x] still needs a well-defined,
+  // self-referencing pointer for every x, or backtracking that walks back
+  // this far (e.g. a chain of C's own self-loop all the way to t=0) falls
+  // through to the {-1,-1} sentinel and then indexes TB[-1][-1] --
+  // negative indices into a vector<vector<Pred>>, a segfault, not a
+  // caught exception. Was never observed before require_full_match
+  // existed because E used to fire almost immediately (any single frame
+  // can complete B->M[k]->E when any state may be both entry and exit),
+  // so backtracking never walked back this far in practice -- but
+  // require_full_match can make E unreachable for an entire short
+  // sequence (it needs the full match-state chain to fit first), which
+  // makes this boundary case real rather than theoretical.
+  for (int s = 0; s < n_states; s++) {
+    TB[0][s] = {0, s};
+  }
   W[0][N] = 0.0;
   W[0][B] = phmm.trans.nb;
   TB[0][N] = {0, N};
@@ -255,7 +279,13 @@ inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
         double emission   = phmm.pdf[n][k].ll(sequence[i]) / log(2.0);
         double from_prev  = W[i-1][prev];
         double from_self  = W[i-1][cur] + phmm.trans.mm[n][k]; // State-specific self-transition
-        double from_entry = W[i-1][B] + phmm.trans.b_to_hmm[n][k];
+        // Skip-in guard: k==1 is the true first match state (k==0 is the
+        // M0 sentinel, never itself entered/updated, see make_hmm()) --
+        // with require_full_match, only it may be entered from B, so a
+        // match can't start partway through a submodel's sequence.
+        double from_entry = (!require_full_match || k == 1)
+            ? W[i-1][B] + phmm.trans.b_to_hmm[n][k]
+            : -INFINITY;
 
         double best_val = from_prev;
         int best_prev_state = prev;
@@ -272,7 +302,11 @@ inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
         W[i][cur]  = emission + best_val;
         TB[i][cur] = {i-1, best_prev_state};
 
-        if (W[i][cur] > W[i][E]) {
+        // Skip-out guard: with require_full_match, only the true last
+        // match state may exit to E, so a match can't end before
+        // reaching a submodel's true end.
+        bool may_exit = !require_full_match || k == last_match_index;
+        if (may_exit && W[i][cur] > W[i][E]) {
           W[i][E]  = W[i][cur];
           TB[i][E] = {i, cur};
         }

@@ -269,7 +269,7 @@ def filter_by_keep_fraction(candidates, keep_fraction, warping_band, epochs,
     return kept, trace
 
 
-def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=500.0):
+def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
     """
     max_match caps how many sub-models sweep_one_state_count() may
     greedily add (BIC then picks how many of those to actually keep).
@@ -277,30 +277,41 @@ def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=
     -- see sweep_one_state_count()/filter_by_keep_fraction()'s
     docstrings -- so raising it much past the default scales the whole
     sweep accordingly, not just this one knob.
+
+    require_full_match forwards to decode_all()/phmm.viterbi() for every
+    trial decode in the sweep -- see phmm.viterbi()'s docstring. Off by
+    default. Passing it through here (not just at find time) means model
+    selection itself is scored the way the model will actually be
+    decoded, instead of picking a state count/sub-model set under lenient
+    partial-match scoring and then deploying it under a stricter rule.
     """
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
     nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
         delayed(sweep_one_state_count)(n_match_states, candidates, max_match, D, n_frames_total,
-                                        flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
+                                        flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
+                                        require_full_match=require_full_match)
         for n_match_states in range(MIN_STATES, MAX_STATES)
     )
     return [r for sublist in nested_results for r in sublist]
 
 
-def sweep_all_medoids(candidates, flank_dwell_frames=None, flank_alpha=500.0):
+def sweep_all_medoids(candidates, flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
     """
     --all-medoids counterpart to sweep(): every filtered candidate
     becomes a sub-model unconditionally (score_all_as_submodels()), so
     this is one make_hmm()+decode_all() per n_match_states value instead
     of sweep()'s O(max_match * candidates^2) greedy search per value --
     --max-match is unused here. Only n_match_states is still BIC-picked.
+
+    require_full_match: see sweep()'s docstring.
     """
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
     return Parallel(n_jobs=-1, backend="loky", verbose=10)(
         delayed(score_all_as_submodels)(n_match_states, candidates, D, n_frames_total,
-                                         flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
+                                         flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
+                                         require_full_match=require_full_match)
         for n_match_states in range(MIN_STATES, MAX_STATES)
     )
 
@@ -687,10 +698,12 @@ def run_train(args):
         print("==========================================")
         if args.all_medoids:
             print(f"all_medoids: every one of {n_filtered} filtered candidates becomes a sub-model (--max-match ignored)")
-            results = sweep_all_medoids(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
+            results = sweep_all_medoids(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+                                         require_full_match=args.require_full_match)
         else:
             print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
-            results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
+            results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+                             require_full_match=args.require_full_match)
         best = min(results, key=lambda r: r["bic"])
         hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
                                   flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
@@ -700,7 +713,8 @@ def run_train(args):
     print("==========================================")
     print("Scoring against the full candidate pool    ")
     print("==========================================")
-    scores_norm, paths, raw_scores = decode_all(candidates, hmm, verbose=args.verbose)
+    scores_norm, paths, raw_scores = decode_all(candidates, hmm, verbose=args.verbose,
+                                                 require_full_match=args.require_full_match)
     well_fits, well_fits_scores = best_fit(scores_norm, args.well_fit_threshold)
     total_fit = sum(scores_norm)
 
@@ -913,13 +927,19 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
 
 
 def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False,
-                  hit_gap_seconds=0.5, target_sample_rate=None):
+                  hit_gap_seconds=0.5, target_sample_rate=None, require_full_match=False):
     """
     Search one recording for hmm's motifs: embed it (cached to
     embeddings.pkl under output_path), Viterbi-decode in one pass, and
     write motif_hits.csv + submodel_<n>_hits.wav under output_path,
     clearing any submodel_*_hits.wav left there from a prior run first.
     Returns the segments found (see extract_motif_segments()).
+
+    require_full_match forwards straight to phmm.viterbi() -- see its
+    docstring/profile_hmm.hpp's viterbi() comment. Off by default: a
+    match may enter or exit a submodel's state chain at any interior
+    state (a partial match). On, a match must run the complete chain,
+    true start to true end.
     """
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -955,7 +975,7 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     print("==========================================")
     print("Motif search: decoding                     ")
     print("==========================================")
-    score, path = phmm.viterbi(embeddings, hmm, noise_pdf)
+    score, path = phmm.viterbi(embeddings, hmm, noise_pdf, require_full_match)
     print(f"Viterbi score: {score:.1f}")
 
     segments = extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=noise_pdf,
@@ -1079,12 +1099,12 @@ def run_find(args):
             print("==========================================")
             find_in_file(wav_file, output_path / wav_file.stem, hmm, n_states, n_models,
                          noise_pdf=noise_pdf, verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds,
-                         target_sample_rate=target_sample_rate)
+                         target_sample_rate=target_sample_rate, require_full_match=args.require_full_match)
     else:
         output_path.mkdir(parents=True, exist_ok=True)
         find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=noise_pdf,
                      verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds,
-                     target_sample_rate=target_sample_rate)
+                     target_sample_rate=target_sample_rate, require_full_match=args.require_full_match)
 
     print("==========================================")
     print("Done")
@@ -1110,6 +1130,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
     train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
     train_parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior -- higher pulls closer to --flank-dwell-frames, lower lets any real observed NOISE counts matter more")
+    train_parser.add_argument("--require-full-match", action="store_true", help="disallow partial matches everywhere train decodes: the BIC sweep's per-candidate trial scoring, the final full-candidate-pool scoring pass (metrics.csv/well_fit/submodel_assignments.csv), all of it. Same meaning as find's --require-full-match (see there) -- a submodel's match-state chain must run true start to true end, no entering/exiting at an interior state. Off by default. Set this to the same value you'll pass to find, so model selection and quality metrics are computed the way the model will actually be decoded, instead of picking/scoring under lenient partial-match rules and then deploying under a stricter one.")
 
     find_parser = subparsers.add_parser("find", help="search a fitted model's motifs in a (potentially large) recording")
     find_parser.add_argument("model_path", help="model pickle produced by `train` (e.g. output_dir/phmm_l2.pkl)")
@@ -1124,6 +1145,7 @@ if __name__ == "__main__":
     find_parser.add_argument("--noise-var-scale", type=float, default=1.0, help="multiply every fitted noise-model covariance (after the var_floor clamp) by this factor. >1 widens the noise Gaussians so background scores competitively against match states over a larger region of embedding space -- a quick way to fight motif segments bleeding into noise without collecting more/broader --noise-wav recordings. Too high starts eating real motif frames into background instead. Default 1.0 (no change). Ignored if --noise-wav isn't set.")
     find_parser.add_argument("--hit-gap-seconds", type=float, default=0.5, help="digital silence (in seconds) inserted between consecutive hits when concatenating each submodel_<n>_hits.wav clip, so occurrence boundaries are audible/visible in a waveform view instead of every hit running seamlessly into the next. 0 disables the gap (old back-to-back behavior).")
     find_parser.add_argument("--resample-hz", type=int, default=None, help=f"resample search and --noise-wav audio to this rate before embedding. Normally you don't pass this: the rate is read from {TRAINING_METADATA_NAME} next to the model, written by `train`, so it matches whatever that model was trained on. Nothing else in the pipeline resamples -- process() hands raw native-rate samples to the Whisper feature extractor while declaring CONFIG['sampling_rate'] -- so searching audio at a rate the model wasn't trained on silently shifts it in pitch/time and degrades every match. Use this only to override the sidecar, or for a model that predates it.")
+    find_parser.add_argument("--require-full-match", action="store_true", help="disallow partial matches: by default a submodel's match-state chain can be entered or exited at any interior state (e.g. matching only the middle of a motif, skipping its start and/or end), because every match state has some trained probability of being a direct entry/exit point from B/to E. With this flag, a match must run the complete chain, true first state to true last state -- no skipping in or out. Self-transitions (dwelling on one state) are unaffected either way, since that's time-stretching an aligned position, not skipping past it. Forwards to phmm.viterbi()'s require_full_match.")
 
     args = parser.parse_args()
     if args.mode == "train":

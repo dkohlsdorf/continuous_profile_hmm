@@ -246,7 +246,7 @@ def estimate_dtw_threshold(candidates, warping_band=5, n_samples=500, percentile
 
 
 def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total,
-                           flank_dwell_frames=None, flank_alpha=500.0):
+                           flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
     best_embeddings = []
     best_classifications = []
     done = set()
@@ -264,7 +264,7 @@ def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_t
                 continue
             hmm, n_states = make_hmm(best_embeddings + [embedding], best_classifications + [classifications], n_match_states,
                                       flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
-            scores_norm, paths, raw_scores = decode_all(embeddings, hmm)
+            scores_norm, paths, raw_scores = decode_all(embeddings, hmm, require_full_match=require_full_match)
             total_fit = sum(scores_norm)
             if best_total < total_fit:
                 best_total = total_fit
@@ -298,7 +298,7 @@ def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_t
 
 
 def score_all_as_submodels(n_match_states, embeddings, dim, n_frames_total,
-                            flank_dwell_frames=None, flank_alpha=500.0):
+                            flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
     """
     Like sweep_one_state_count(), but skips the greedy exemplar
     selection entirely: every sequence in `embeddings` becomes its own
@@ -315,7 +315,7 @@ def score_all_as_submodels(n_match_states, embeddings, dim, n_frames_total,
 
     hmm, n_states = make_hmm(all_embeddings, all_classifications, n_match_states,
                               flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha)
-    scores_norm, paths, raw_scores = decode_all(embeddings, hmm)
+    scores_norm, paths, raw_scores = decode_all(embeddings, hmm, require_full_match=require_full_match)
 
     n_sub_models = len(all_embeddings)
     ll_nats = sum(raw_scores) * np.log(2)
@@ -331,13 +331,17 @@ def score_all_as_submodels(n_match_states, embeddings, dim, n_frames_total,
     }
 
 
-def decode_all(embeddings, hmm, verbose=False, log_every=None):
+def decode_all(embeddings, hmm, verbose=False, log_every=None, require_full_match=False):
     """
     verbose logs progress every log_every sequences (default: ~20 log
     lines spread across the pool, regardless of its size). Off by
     default since this is called on every greedy candidate trial inside
     sweep_one_state_count() -- turn it on only for a one-off decode over
     a large pool, e.g. motif_discovery.py's final full-pool scoring pass.
+
+    require_full_match forwards to phmm.viterbi() -- see its docstring.
+    Off by default, matching the sweep's own scoring (which never passed
+    it before this option existed).
     """
     n_total = len(embeddings)
     if verbose and log_every is None:
@@ -347,7 +351,7 @@ def decode_all(embeddings, hmm, verbose=False, log_every=None):
     paths  = []
     start = time.time() if verbose else None
     for i, (_, embedding, classifications) in enumerate(embeddings):
-        score, path = phmm.viterbi(embedding, hmm)
+        score, path = phmm.viterbi(embedding, hmm, None, require_full_match)
         scores.append(score)
         paths.append(path)
         if verbose and ((i + 1) % log_every == 0 or i + 1 == n_total):

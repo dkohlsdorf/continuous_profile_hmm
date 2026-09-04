@@ -34,6 +34,10 @@ Input:
                                         # values >1 flatly handicap the noise model by
                                         # D/2*log2(scale) bits and break mean_llr_score
             "hit_gap_seconds": 0.5,     # optional, default 0.5 (silence gap between hits in submodel_<n>_hits.wav)
+            "require_full_match": false,           # optional, default false -- disallow partial matches
+                                                    # (entering/exiting a submodel's match-state chain at
+                                                    # an interior state). See motif_discovery.py's
+                                                    # --require-full-match / phmm.viterbi()'s docstring.
             "use_embeddings_cache": true,          # optional, default true (see Embeddings cache below)
             "embeddings_cache_folder_id": "..."    # optional, defaults to a "motif_embeddings_cache"
                                                    # folder under the output parent, created on demand
@@ -372,12 +376,18 @@ def convert_to_mono_first_channel(input_path, output_path):
         raise RuntimeError(f"ffmpeg mono conversion failed for {input_path}:\n{result.stderr}")
 
 
-def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_seconds):
+def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
+             require_full_match=False):
     """
     Run motif_discovery.py find for one wav file against the packaged L2
     model + noise recording, streaming its output live. cwd=APP_DIR because
     CONFIG['checkpoint_path'] (lib_phmm/config.py) is a path relative to cwd,
     not to motif_discovery.py's location.
+
+    require_full_match forwards to find's --require-full-match (see there
+    and phmm.viterbi()'s docstring) -- disallows partial matches (entering
+    or exiting a submodel's match-state chain at an interior state). Off
+    by default, matching find's own default.
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'find',
@@ -389,6 +399,8 @@ def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_s
         '--hit-gap-seconds', str(hit_gap_seconds),
         '--verbose',
     ]
+    if require_full_match:
+        cmd.append('--require-full-match')
     process = subprocess.Popen(
         cmd, cwd=APP_DIR,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -441,7 +453,7 @@ def save_noise_embeddings(output_path):
 
 
 def process_one_file(service, file_info, run_output_folder_id, noise_components, noise_var_scale,
-                      hit_gap_seconds, embeddings_cache_folder_id=None):
+                      hit_gap_seconds, embeddings_cache_folder_id=None, require_full_match=False):
     """
     Download -> convert to mono -> find -> upload -> delete local files, for
     a single Drive file. Returns a result dict; never raises (errors are
@@ -495,7 +507,8 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
         restore_noise_embeddings(output_path)
 
         print(f"  Running find: {name}")
-        run_find(mono_path, output_path, noise_components, noise_var_scale, hit_gap_seconds)
+        run_find(mono_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
+                 require_full_match=require_full_match)
 
         save_noise_embeddings(output_path)
 
@@ -558,6 +571,11 @@ def handler(job):
     hit_gap_seconds = job_input.get('hit_gap_seconds', 0.5)
     use_embeddings_cache = job_input.get('use_embeddings_cache', True)
     embeddings_cache_folder_id = job_input.get('embeddings_cache_folder_id')
+    # See motif_discovery.py's --require-full-match / phmm.viterbi()'s
+    # docstring: disallows partial matches (entering/exiting a submodel's
+    # match-state chain at an interior state). Off by default, matching
+    # find's own default.
+    require_full_match = bool(job_input.get('require_full_match', False))
 
     if not gdrive_folder_id:
         return {"error": "gdrive_folder_id is required"}
@@ -571,7 +589,8 @@ def handler(job):
 
     print(f"Input Google Drive folder: {gdrive_folder_id}")
     print(f"Output Google Drive folder: {output_gdrive_folder_id or '(same as input)'}")
-    print(f"noise_components={noise_components} noise_var_scale={noise_var_scale} hit_gap_seconds={hit_gap_seconds}")
+    print(f"noise_components={noise_components} noise_var_scale={noise_var_scale} "
+          f"hit_gap_seconds={hit_gap_seconds} require_full_match={require_full_match}")
 
     try:
         print("\nInitializing Google Drive connection...")
@@ -605,6 +624,7 @@ def handler(job):
                 service, file_info, run_output_folder_id,
                 noise_components, noise_var_scale, hit_gap_seconds,
                 embeddings_cache_folder_id=cache_folder_id,
+                require_full_match=require_full_match,
             ))
 
         files_processed = sum(1 for r in results if r["status"] == "success")
