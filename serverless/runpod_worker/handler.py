@@ -41,8 +41,24 @@ Input:
             "use_embeddings_cache": true,          # optional, default true (see Embeddings cache below)
             "embeddings_cache_folder_id": "..."    # optional, defaults to a "motif_embeddings_cache"
                                                    # folder under the output parent, created on demand
+            "pvl_file_id": "..."        # optional, default none -- a Drive file id for a PVL .xlsx
+                                        # shotlog (see Annotation below). Downloaded once per job; if
+                                        # omitted, annotation is simply skipped, find is unaffected.
         }
     }
+
+Annotation:
+    When pvl_file_id is given, each recording's motif_hits.csv is merged
+    into the matching rows of the PVL via annotate.py, producing
+    annotated_motif_hits.csv alongside it (uploaded automatically -- it's
+    just another file in that recording's output_path by the time results
+    upload). Which PVL rows match a recording is decided by an encounter
+    number read from the recording's OWN FILENAME (encounter_from_filename()
+    -- same "E<number>_..." convention as annotate.py's key(), e.g.
+    "E1234_dolphins.wav" -> encounter 1234): if your recordings aren't named
+    that way, or an encounter isn't in the PVL, that one file's annotation
+    is skipped (logged, not fatal) -- find's own results for it still
+    upload normally.
 
 Embeddings cache:
     Whisper-decoding a recording dominates find's runtime, and the result
@@ -89,6 +105,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 MOTIF_DISCOVERY_SCRIPT = "/app/motif_discovery.py"
+ANNOTATE_SCRIPT = "/app/annotate.py"
 APP_DIR = "/app"
 MODEL_PATH = "/app/motif/l2/phmm_l2.pkl"
 NOISE_WAV_PATH = "/app/assets/naive_noise.wav"
@@ -413,6 +430,35 @@ def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_s
         raise RuntimeError(f"motif_discovery.py find failed with return code {process.returncode}")
 
 
+def encounter_from_filename(stem):
+    """
+    "E1234_whatever" -> 1234 -- same convention as annotate.py's own key(),
+    duplicated (not imported) rather than shared, since annotate.py runs as
+    its own subprocess here, same as motif_discovery.py; handler.py never
+    imports either script's internals.
+    """
+    return int(stem.split('_')[0][1:])
+
+
+def run_annotate(output_path, pvl_path, encounter):
+    """
+    Best-effort: merge this recording's motif_hits.csv into the matching
+    rows of the job's PVL spreadsheet via annotate.py, writing
+    annotated_motif_hits.csv into output_path -- picked up automatically by
+    the upload_folder_contents() call that follows in process_one_file().
+    Never raises: an encounter that isn't in this PVL, or any other
+    annotate.py failure, must not fail a file that find already succeeded
+    on -- it just means no annotated_motif_hits.csv gets uploaded for it.
+    """
+    cmd = ['python', '-u', ANNOTATE_SCRIPT, output_path, pvl_path, '--encounter', str(encounter)]
+    result = subprocess.run(cmd, cwd=APP_DIR, capture_output=True, text=True)
+    if result.returncode != 0:
+        last_line = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+        print(f"  (annotation skipped: {last_line})")
+    else:
+        print(f"  {result.stdout.strip()}")
+
+
 def count_hits(motif_hits_csv):
     """Row count of motif_hits.csv minus its header, or 0 if it's missing/empty."""
     if not os.path.exists(motif_hits_csv):
@@ -453,18 +499,25 @@ def save_noise_embeddings(output_path):
 
 
 def process_one_file(service, file_info, run_output_folder_id, noise_components, noise_var_scale,
-                      hit_gap_seconds, embeddings_cache_folder_id=None, require_full_match=False):
+                      hit_gap_seconds, embeddings_cache_folder_id=None, require_full_match=False,
+                      pvl_path=None):
     """
-    Download -> convert to mono -> find -> upload -> delete local files, for
-    a single Drive file. Returns a result dict; never raises (errors are
-    captured in the "status"/"error" fields) so one bad file doesn't abort
-    the rest of the folder.
+    Download -> convert to mono -> find -> annotate -> upload -> delete
+    local files, for a single Drive file. Returns a result dict; never
+    raises (errors are captured in the "status"/"error" fields) so one bad
+    file doesn't abort the rest of the folder.
 
     When embeddings_cache_folder_id is given, <stem>.pkl there is pulled in
     as this run's embeddings.pkl before find (skipping the Whisper decode
     entirely) and written back afterwards if it wasn't cached yet. The
     embedding depends only on the audio, not on any --noise-* setting, so a
     cache entry stays valid across runs that sweep those parameters.
+
+    When pvl_path is given (the job's PVL spreadsheet, already downloaded
+    once for the whole job -- see handler()), run_annotate() merges this
+    file's motif_hits.csv into it, keyed by an encounter number read from
+    this recording's own filename (see encounter_from_filename()) --
+    best-effort, see run_annotate()'s docstring.
     """
     name = file_info['name']
     stem = Path(name).stem
@@ -513,6 +566,15 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
         save_noise_embeddings(output_path)
 
         hits = count_hits(os.path.join(output_path, 'motif_hits.csv'))
+
+        if pvl_path:
+            try:
+                encounter = encounter_from_filename(stem)
+            except (ValueError, IndexError) as e:
+                print(f"  (annotation skipped: couldn't read an encounter number from '{name}' "
+                      f"-- expected \"E<number>_...\": {e})")
+            else:
+                run_annotate(output_path, pvl_path, encounter)
 
         embeddings_uploaded = False
         if embeddings_cache_folder_id and not embeddings_cached and os.path.exists(embeddings_path):
@@ -576,6 +638,11 @@ def handler(job):
     # match-state chain at an interior state). Off by default, matching
     # find's own default.
     require_full_match = bool(job_input.get('require_full_match', False))
+    # Optional: a Drive file id for a PVL .xlsx shotlog. If given, every
+    # file's motif_hits.csv gets merged into it via annotate.py (see
+    # process_one_file()/run_annotate()); if not, annotation is simply
+    # skipped -- find itself is unaffected either way.
+    pvl_file_id = job_input.get('pvl_file_id')
 
     if not gdrive_folder_id:
         return {"error": "gdrive_folder_id is required"}
@@ -617,15 +684,39 @@ def handler(job):
             )
             print(f"Embeddings cache folder: {cache_folder_id}")
 
-        results = []
-        for i, file_info in enumerate(files):
-            print(f"\n[{i + 1}/{len(files)}] {file_info['name']}")
-            results.append(process_one_file(
-                service, file_info, run_output_folder_id,
-                noise_components, noise_var_scale, hit_gap_seconds,
-                embeddings_cache_folder_id=cache_folder_id,
-                require_full_match=require_full_match,
-            ))
+        # Downloaded once per job (not per file, unlike the embeddings
+        # cache): one PVL covers many encounters/files, and re-downloading
+        # it per file would be pure waste. Lives in its own tempdir (not a
+        # fixed path like NOISE_EMBEDDINGS_CACHE_PATH) so a stale PVL from
+        # a *previous* job can never leak into this one -- every handler()
+        # call gets a fresh mkdtemp(), and it's cleaned up below regardless
+        # of how the job ends.
+        pvl_path = None
+        pvl_work_dir = None
+        if pvl_file_id:
+            pvl_work_dir = tempfile.mkdtemp(prefix='motif_pvl_')
+            pvl_path = os.path.join(pvl_work_dir, 'pvl.xlsx')
+            print(f"\nDownloading PVL file: {pvl_file_id}")
+            try:
+                download_file(service, pvl_file_id, pvl_path)
+            except Exception as e:
+                print(f"WARNING: failed to download PVL file ({e}) -- skipping annotation for this job")
+                pvl_path = None
+
+        try:
+            results = []
+            for i, file_info in enumerate(files):
+                print(f"\n[{i + 1}/{len(files)}] {file_info['name']}")
+                results.append(process_one_file(
+                    service, file_info, run_output_folder_id,
+                    noise_components, noise_var_scale, hit_gap_seconds,
+                    embeddings_cache_folder_id=cache_folder_id,
+                    require_full_match=require_full_match,
+                    pvl_path=pvl_path,
+                ))
+        finally:
+            if pvl_work_dir:
+                shutil.rmtree(pvl_work_dir, ignore_errors=True)
 
         files_processed = sum(1 for r in results if r["status"] == "success")
         files_failed = sum(1 for r in results if r["status"] == "error")

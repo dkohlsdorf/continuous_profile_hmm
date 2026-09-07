@@ -42,16 +42,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY serverless/runpod_worker/requirements.txt .
-
 # torch/torchaudio/torchvision are pulled from the cu128 index specifically
 # (rather than the base image's own build, or the default PyPI cu126 build)
 # because newer GPU architectures (e.g. Blackwell) have no compiled kernels
 # in the older builds, causing "no kernel image is available for execution
 # on the device" on a RunPod pod with a newer card.
+#
+# Deliberately its own layer, before requirements.txt is even copied in:
+# this is the slowest step in the whole build (multi-GB CUDA wheels), and
+# Docker's layer cache invalidates a RUN the instant anything copied before
+# it changes -- so if requirements.txt were copied first, every future
+# dependency addition (e.g. openpyxl for annotate.py) would force a full
+# torch reinstall even though torch itself never changed.
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128 && \
-    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+
+COPY serverless/runpod_worker/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir runpod google-api-python-client google-auth
 
 # Project source. lib_phmm's checked-in profile_hmm.cpython-*.so /
@@ -59,6 +66,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # .dockerignore) and won't load here -- rebuilt below for this container's
 # Linux/Python instead.
 COPY motif_discovery.py .
+COPY annotate.py .
 COPY lib_phmm/ ./lib_phmm/
 
 RUN cd lib_phmm && pip install --no-cache-dir -e . --no-build-isolation && cd ..
