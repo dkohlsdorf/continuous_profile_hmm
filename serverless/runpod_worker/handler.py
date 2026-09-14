@@ -47,6 +47,45 @@ Input:
         }
     }
 
+Extend mode:
+    Set "mode": "extend" to run a different, staged pipeline instead of the
+    find job above -- see handle_extend()'s docstring for the full stage
+    breakdown (embed -> build candidates -> train a new model -> find with
+    it). Same output_gdrive_folder_id/noise_*/require_full_match/
+    pvl_file_id inputs apply (the noise_*/require_full_match/pvl_file_id
+    ones only matter once the pipeline reaches its find stage), plus:
+        "mode": "extend",
+        "gdrive_folder_id": "..." or ["...", "..."],  # one folder id, or a
+                                    # list of them -- every file across all
+                                    # of them feeds the same shared
+                                    # candidates pool/model (not a separate
+                                    # pipeline per folder). output_gdrive_
+                                    # folder_id anchors the state/output
+                                    # folders if given, else the first
+                                    # listed input folder does.
+        "min_region_frames": 10,    # optional, default 10 -- shortest
+                                    # contiguous non-NOISE run (in frames)
+                                    # to keep as a new training candidate
+        "all_medoids": true         # optional, default true (NOT
+                                    # train-candidates' own CLI default) --
+                                    # every DTW-filtered candidate becomes
+                                    # its own sub-model directly, skipping
+                                    # the greedy O(max_match * candidates^2)
+                                    # sub-model search. Set false to use
+                                    # that search instead; see
+                                    # run_train_candidates()'s docstring for
+                                    # why growing-pool extend defaults the
+                                    # other way from train-candidates itself.
+    Call repeatedly (one job submission per stage) until the response's
+    "stage" field reports "find" -- each call only advances the pipeline
+    by whichever single stage isn't done yet, so a multi-hour DTW filter +
+    BIC sweep (the training stage) is never bundled into the same job as
+    embedding or searching a whole folder. State (the growing
+    candidates.pkl, then phmm_extended.pkl) lives in a persistent
+    "motif_extend_state" Drive folder under the output parent, alongside
+    the existing "motif_embeddings_cache" folder both this mode and find
+    share.
+
 Annotation:
     When pvl_file_id is given, each recording's motif_hits.csv is merged
     into the matching rows of the PVL via annotate.py, producing
@@ -109,6 +148,18 @@ ANNOTATE_SCRIPT = "/app/annotate.py"
 APP_DIR = "/app"
 MODEL_PATH = "/app/motif/l2/phmm_l2.pkl"
 NOISE_WAV_PATH = "/app/assets/naive_noise.wav"
+BAKED_CANDIDATES_PATH = "/app/motif/l2/candidates.pkl"
+TRAINING_METADATA_PATH = "/app/motif/l2/training_metadata.json"
+
+# Persistent (NOT per-run/timestamped) Drive folder holding one "extend" job
+# family's staged state -- candidates.pkl, then phmm_extended.pkl once
+# trained -- so repeated job submissions pick up where the last one left
+# off (see handle_extend()). Created on demand under the output parent
+# folder, same convention as EMBEDDINGS_CACHE_FOLDER_NAME below.
+EXTEND_STATE_FOLDER_NAME = "motif_extend_state"
+EXTEND_CANDIDATES_NAME = "candidates.pkl"
+EXTEND_MODEL_NAME = "phmm_extended.pkl"
+EXTEND_TRAINING_METADATA_NAME = "training_metadata.json"
 
 # motif_hits.csv + submodel_<n>_hits.wav are this run's deliverables.
 # embeddings.pkl goes to the persistent Drive cache folder instead (see
@@ -394,12 +445,15 @@ def convert_to_mono_first_channel(input_path, output_path):
 
 
 def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
-             require_full_match=False):
+             require_full_match=False, model_path=MODEL_PATH):
     """
-    Run motif_discovery.py find for one wav file against the packaged L2
-    model + noise recording, streaming its output live. cwd=APP_DIR because
+    Run motif_discovery.py find for one wav file against a model + the
+    packaged noise recording, streaming its output live. cwd=APP_DIR because
     CONFIG['checkpoint_path'] (lib_phmm/config.py) is a path relative to cwd,
     not to motif_discovery.py's location.
+
+    model_path defaults to the packaged L2 model; handle_extend() overrides
+    it with a downloaded phmm_extended.pkl once one exists.
 
     require_full_match forwards to find's --require-full-match (see there
     and phmm.viterbi()'s docstring) -- disallows partial matches (entering
@@ -408,7 +462,7 @@ def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_s
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'find',
-        MODEL_PATH, wav_path, output_path,
+        model_path, wav_path, output_path,
         '--noise-wav', NOISE_WAV_PATH,
         '--noise-components', str(noise_components),
         '--noise-bayesian',
@@ -457,6 +511,83 @@ def run_annotate(output_path, pvl_path, encounter):
         print(f"  (annotation skipped: {last_line})")
     else:
         print(f"  {result.stdout.strip()}")
+
+
+def _as_folder_id_list(value):
+    """gdrive_folder_id accepts either one folder id or a list of them (extend mode only, see handle_extend())."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def read_training_sample_rate(metadata_path):
+    """
+    Same convention as motif_discovery.py's load_training_sample_rate(),
+    read directly here since handler.py never imports either script's
+    internals (both only ever run as subprocesses -- see run_annotate()'s
+    docstring for why).
+    """
+    with open(metadata_path) as f:
+        return int(json.load(f)['sample_rate'])
+
+
+def _stream_subprocess(cmd, step_name):
+    """Shared plumbing for the extend-pipeline subprocess wrappers below --
+    same streaming/error-checking shape as run_find()."""
+    process = subprocess.Popen(
+        cmd, cwd=APP_DIR,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for line in process.stdout:
+        print(f"    {line}", end='', flush=True)
+    process.wait()
+    if process.returncode != 0:
+        raise RuntimeError(f"motif_discovery.py {step_name} failed with return code {process.returncode}")
+
+
+def run_embed(wav_path, output_path, resample_hz):
+    """motif_discovery.py embed for one file -- find's embedding step with no model needed yet."""
+    _stream_subprocess([
+        'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'embed',
+        wav_path, output_path,
+        '--resample-hz', str(resample_hz),
+        '--verbose',
+    ], 'embed')
+
+
+def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidates_path, min_region_frames):
+    """motif_discovery.py extend-candidates -- combine the baked L2 candidates with new ones mined from embeddings_dir."""
+    _stream_subprocess([
+        'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'extend-candidates',
+        baked_candidates_path, embeddings_dir, output_candidates_path,
+        '--min-region-frames', str(min_region_frames),
+    ], 'extend-candidates')
+
+
+def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True):
+    """
+    motif_discovery.py train-candidates -- fit a new model directly from a
+    candidates.pkl. all_medoids defaults on here (unlike train-candidates'
+    own CLI default): extend's whole point is a pool that keeps growing
+    every training cycle (baked L2 candidates + everything mined since), so
+    the greedy O(max_match * candidates^2) sub-model search train-candidates
+    otherwise runs is exactly the cost that scales worst as that pool grows
+    -- --all-medoids instead makes every DTW-filtered candidate its own
+    sub-model directly, BIC-picking only n_match_states.
+    """
+    cmd = [
+        'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
+        candidates_path, output_path,
+        '--sample-rate', str(sample_rate),
+        '--model-name', EXTEND_MODEL_NAME,
+        '--verbose',
+    ]
+    if all_medoids:
+        cmd.append('--all-medoids')
+    _stream_subprocess(cmd, 'train-candidates')
 
 
 def count_hits(motif_hits_csv):
@@ -615,9 +746,290 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
         print(f"  Cleaned up local files for: {name}")
 
 
+def handle_extend(job_input):
+    """
+    Staged, resumable pipeline that grows the packaged L2 motif model with
+    new candidate material mined from a folder of recordings, one stage per
+    job submission. Checked in this order (before touching any file, so a
+    job landing on the training stage doesn't pay to download/embed
+    recordings it won't use):
+
+      A. No candidates.pkl in the extend state folder yet: embed every
+         recording in gdrive_folder_id (Drive-cached exactly like `find`'s
+         embeddings cache, so repeated submissions across stages never
+         re-decode a file), extract non-NOISE regions from those embeddings
+         (motif_discovery.py's extract_non_noise_candidates(), via the
+         extend-candidates subcommand), combine them with the packaged
+         /app/motif/l2/candidates.pkl, upload the result as this job
+         family's candidates.pkl, and stop.
+      B. Candidates exist but no phmm_extended.pkl yet: fit a new profile
+         HMM from that combined pool (train-candidates -- same DTW-filter +
+         BIC-sweep discovery path `train` uses), upload it, and stop. Needs
+         none of the recordings' audio, only the uploaded candidates.pkl.
+      C. Model exists: embed every recording (same Drive cache as stage A),
+         run `find` with the new model against each, annotate against
+         pvl_file_id if given, upload results.
+
+    Each call does exactly the one stage that isn't done yet -- call again
+    to advance to the next. This mirrors the embeddings-cache pattern
+    already used elsewhere in this handler, and keeps what can be a
+    multi-hour DTW filter + BIC sweep (stage B) as its own job rather than
+    tacked onto a job that's also embedding/searching a whole folder.
+
+    job_input keys (all beyond gdrive_folder_id are optional):
+        gdrive_folder_id      -- one folder id or a list of them; every file
+                                 across all of them feeds the same shared
+                                 candidates pool/model
+        output_gdrive_folder_id  -- same meaning as find's
+        min_region_frames    -- default 10, see extend-candidates' own flag
+        all_medoids           -- default True, see run_train_candidates()
+        noise_components, noise_var_scale, hit_gap_seconds, require_full_match,
+        pvl_file_id           -- same meaning as find's, used only at the find stage
+
+    Returns a dict with a "stage" field (candidates_built / model_trained /
+    find) so the caller knows what just happened and what a follow-up
+    submission will do.
+    """
+    gdrive_folder_ids = _as_folder_id_list(job_input.get('gdrive_folder_id'))
+    output_gdrive_folder_id = job_input.get('output_gdrive_folder_id')
+    if not gdrive_folder_ids:
+        return {"error": "gdrive_folder_id is required"}
+
+    min_region_frames = int(job_input.get('min_region_frames', 10))
+    noise_components = int(job_input.get('noise_components', 6))
+    noise_var_scale = float(job_input.get('noise_var_scale', 1.0))
+    hit_gap_seconds = float(job_input.get('hit_gap_seconds', 0.5))
+    require_full_match = bool(job_input.get('require_full_match', False))
+    # See run_train_candidates()'s docstring for why this defaults to True
+    # here specifically (unlike train-candidates' own CLI default).
+    all_medoids = bool(job_input.get('all_medoids', True))
+    pvl_file_id = job_input.get('pvl_file_id')
+
+    service = get_drive_service()
+    # output_gdrive_folder_id, or the first input folder if not given -- same
+    # fallback find's handler() uses, just against a list here since multiple
+    # source folders all feed one shared candidates pool/model.
+    parent_folder_for_output = output_gdrive_folder_id or gdrive_folder_ids[0]
+
+    print(f"\nListing WAV/M4A files in {len(gdrive_folder_ids)} Google Drive folder(s)...")
+    files = []
+    for folder_id in gdrive_folder_ids:
+        folder_files = list_audio_files(service, folder_id)
+        print(f"  {folder_id}: {len(folder_files)} audio files")
+        files.extend(folder_files)
+    if not files:
+        return {"error": "No WAV/M4A files found in the specified Google Drive folder(s)"}
+    print(f"Found {len(files)} audio files total across {len(gdrive_folder_ids)} folder(s)")
+
+    state_folder_id = find_or_create_folder(service, parent_folder_for_output, EXTEND_STATE_FOLDER_NAME)
+    embeddings_cache_folder_id = find_or_create_folder(service, parent_folder_for_output, EMBEDDINGS_CACHE_FOLDER_NAME)
+
+    training_sample_rate = read_training_sample_rate(TRAINING_METADATA_PATH)
+    print(f"Baked model's training rate: {training_sample_rate} Hz (embedding new audio at this rate to match)")
+
+    # Check which stage is next BEFORE touching any file -- the training
+    # stage (candidates exist, no model yet) needs none of the recordings'
+    # audio at all, so a job that lands there shouldn't pay for downloading
+    # and embedding every file first just to discover that.
+    candidates_id = find_file(service, state_folder_id, EXTEND_CANDIDATES_NAME)
+    model_id = find_file(service, state_folder_id, EXTEND_MODEL_NAME) if candidates_id else None
+
+    # ---- Stage: candidates exist but no trained model yet -> train ----
+    if candidates_id and not model_id:
+        print(f"\n{EXTEND_CANDIDATES_NAME} exists but no {EXTEND_MODEL_NAME} yet -- training a new model")
+        train_work_dir = tempfile.mkdtemp(prefix='motif_extend_train_')
+        try:
+            candidates_local = os.path.join(train_work_dir, EXTEND_CANDIDATES_NAME)
+            download_file(service, candidates_id, candidates_local)
+            train_output = os.path.join(train_work_dir, 'output')
+            os.makedirs(train_output, exist_ok=True)
+            run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids)
+
+            model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
+            metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
+            print(f"Uploading trained model to extend state folder: {EXTEND_MODEL_NAME}")
+            upload_file(service, state_folder_id, model_local, EXTEND_MODEL_NAME)
+            if os.path.exists(metadata_local):
+                upload_file(service, state_folder_id, metadata_local, EXTEND_TRAINING_METADATA_NAME)
+            metrics_local = os.path.join(train_output, 'metrics.csv')
+            if os.path.exists(metrics_local):
+                upload_file(service, state_folder_id, metrics_local, 'metrics.csv')
+        finally:
+            shutil.rmtree(train_work_dir, ignore_errors=True)
+
+        return {
+            "status": "success",
+            "stage": "model_trained",
+            "state_folder_id": state_folder_id,
+        }
+
+    # Both remaining stages (building candidates, and searching with a
+    # trained model) need every recording downloaded, converted, and
+    # embedded -- Drive-cached exactly like `find`'s own embeddings cache,
+    # so repeated submissions across stages never re-decode a file.
+    work_dirs = []
+    embedded = []
+    try:
+        for i, file_info in enumerate(files):
+            name = file_info['name']
+            stem = Path(name).stem
+            print(f"\n[{i + 1}/{len(files)}] embedding {name}")
+            cache_name = f"{stem}.{EMBEDDINGS_CACHE_VERSION}.pkl"
+            work_dir = tempfile.mkdtemp(prefix='motif_extend_')
+            work_dirs.append(work_dir)
+            output_path = os.path.join(work_dir, 'output')
+            os.makedirs(output_path, exist_ok=True)
+            embeddings_path = os.path.join(output_path, 'embeddings.pkl')
+
+            embeddings_cached = False
+            try:
+                cached_id = find_file(service, embeddings_cache_folder_id, cache_name)
+                if cached_id:
+                    print(f"  Using cached embeddings from Drive: {cache_name}")
+                    download_file(service, cached_id, embeddings_path)
+                    embeddings_cached = True
+            except Exception as e:
+                print(f"  (embeddings cache fetch failed, re-embedding: {e})")
+                if os.path.exists(embeddings_path):
+                    os.remove(embeddings_path)
+                embeddings_cached = False
+
+            raw_path = os.path.join(work_dir, name)
+            mono_path = os.path.join(work_dir, 'mono.wav')
+            print(f"  Downloading: {name}")
+            download_file(service, file_info['id'], raw_path)
+            print(f"  Converting to mono (first channel): {name}")
+            convert_to_mono_first_channel(raw_path, mono_path)
+
+            if not embeddings_cached:
+                print(f"  Embedding: {name}")
+                run_embed(mono_path, output_path, training_sample_rate)
+                if os.path.exists(embeddings_path):
+                    try:
+                        print(f"  Caching embeddings to Drive: {cache_name}")
+                        upload_file(service, embeddings_cache_folder_id, embeddings_path, cache_name)
+                    except Exception as e:
+                        print(f"  (caching embeddings failed, will re-embed next run: {e})")
+
+            embedded.append({
+                "file_info": file_info, "stem": stem, "work_dir": work_dir,
+                "output_path": output_path, "embeddings_path": embeddings_path, "mono_path": mono_path,
+            })
+
+        # ---- Stage: no combined candidates.pkl yet -> build one ----
+        if not candidates_id:
+            print(f"\nNo {EXTEND_CANDIDATES_NAME} in extend state folder yet -- building one")
+            embroot = tempfile.mkdtemp(prefix='motif_extend_embroot_')
+            try:
+                for e in embedded:
+                    dest = os.path.join(embroot, e["stem"])
+                    os.makedirs(dest, exist_ok=True)
+                    shutil.copy2(e["embeddings_path"], os.path.join(dest, "embeddings.pkl"))
+
+                baked_local = os.path.join(embroot, "baked_candidates.pkl")
+                shutil.copy2(BAKED_CANDIDATES_PATH, baked_local)
+                combined_local = os.path.join(embroot, EXTEND_CANDIDATES_NAME)
+                run_extend_candidates(baked_local, embroot, combined_local, min_region_frames)
+
+                print(f"Uploading combined candidates to extend state folder: {EXTEND_CANDIDATES_NAME}")
+                upload_file(service, state_folder_id, combined_local, EXTEND_CANDIDATES_NAME)
+            finally:
+                shutil.rmtree(embroot, ignore_errors=True)
+
+            return {
+                "status": "success",
+                "stage": "candidates_built",
+                "state_folder_id": state_folder_id,
+                "files_embedded": len(embedded),
+            }
+
+        # ---- Stage: model exists -> find against every file + annotate ----
+        print(f"\n{EXTEND_MODEL_NAME} exists -- running find against all recordings")
+        model_work_dir = tempfile.mkdtemp(prefix='motif_extend_model_')
+        pvl_path, pvl_work_dir = None, None
+        try:
+            model_local = os.path.join(model_work_dir, EXTEND_MODEL_NAME)
+            download_file(service, model_id, model_local)
+            metadata_id = find_file(service, state_folder_id, EXTEND_TRAINING_METADATA_NAME)
+            if metadata_id:
+                download_file(service, metadata_id, os.path.join(model_work_dir, EXTEND_TRAINING_METADATA_NAME))
+
+            if pvl_file_id:
+                pvl_work_dir = tempfile.mkdtemp(prefix='motif_extend_pvl_')
+                pvl_path = os.path.join(pvl_work_dir, 'pvl.xlsx')
+                try:
+                    download_file(service, pvl_file_id, pvl_path)
+                except Exception as e:
+                    print(f"WARNING: failed to download PVL file ({e}) -- skipping annotation for this job")
+                    pvl_path = None
+
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            output_folder_name = f"motif_extend_find_{timestamp}"
+            run_output_folder_id = create_output_folder(service, parent_folder_for_output, output_folder_name)
+
+            results = []
+            for i, e in enumerate(embedded):
+                name = e["file_info"]["name"]
+                stem = e["stem"]
+                print(f"\n[{i + 1}/{len(embedded)}] {name}")
+                try:
+                    print(f"  Running find: {name}")
+                    run_find(e["mono_path"], e["output_path"], noise_components, noise_var_scale,
+                             hit_gap_seconds, require_full_match=require_full_match, model_path=model_local)
+                    hits = count_hits(os.path.join(e["output_path"], "motif_hits.csv"))
+                    if pvl_path:
+                        try:
+                            encounter = encounter_from_filename(stem)
+                        except (ValueError, IndexError) as err:
+                            print(f"  (annotation skipped: couldn't read an encounter number from '{name}' "
+                                  f"-- expected \"E<number>_...\": {err})")
+                        else:
+                            run_annotate(e["output_path"], pvl_path, encounter)
+                    file_output_folder_id = create_output_folder(service, run_output_folder_id, stem)
+                    uploaded = upload_folder_contents(service, file_output_folder_id, e["output_path"],
+                                                       skip_names=UPLOAD_SKIP_NAMES)
+                    results.append({"name": name, "status": "success", "hits": hits, "uploaded": uploaded,
+                                     "output_folder_id": file_output_folder_id})
+                except Exception as err:
+                    import traceback
+                    print(f"  ERROR processing {name}: {err}\n{traceback.format_exc()}")
+                    results.append({"name": name, "status": "error", "error": str(err)})
+
+            return {
+                "status": "success",
+                "stage": "find",
+                "output_folder_id": run_output_folder_id,
+                "output_folder_name": output_folder_name,
+                "files_found": len(files),
+                "files_processed": sum(1 for r in results if r["status"] == "success"),
+                "files_failed": sum(1 for r in results if r["status"] == "error"),
+                "results": results,
+            }
+        finally:
+            shutil.rmtree(model_work_dir, ignore_errors=True)
+            if pvl_work_dir:
+                shutil.rmtree(pvl_work_dir, ignore_errors=True)
+    finally:
+        for wd in work_dirs:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
 def handler(job):
     """RunPod serverless handler function."""
     job_input = job.get('input', {})
+
+    # "extend" is a separate, staged pipeline (see handle_extend()'s
+    # docstring) -- everything below this dispatch is the original `find`
+    # job, unchanged, and stays the default when mode is omitted.
+    mode = job_input.get('mode', 'find')
+    if mode == 'extend':
+        try:
+            return handle_extend(job_input)
+        except Exception as e:
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            print(f"ERROR: {error_msg}")
+            return {"error": error_msg}
 
     gdrive_folder_id = job_input.get('gdrive_folder_id')
     output_gdrive_folder_id = job_input.get('output_gdrive_folder_id')

@@ -94,6 +94,12 @@ COPY model/wdp_whisper_emb_model_L2.pt ./model/wdp_whisper_emb_model_L2.pt
 COPY serverless/runpod_worker/assets/phmm_l2.pkl ./motif/l2/phmm_l2.pkl
 COPY serverless/runpod_worker/assets/naive_noise.wav ./assets/naive_noise.wav
 
+# L2's candidate embeddings (motif_discovery.py train's candidates.pkl
+# cache) -- the "extend" job mode's starting pool, grown with new candidates
+# mined from a job's own recordings before retraining (see handler.py's
+# handle_extend()/motif_discovery.py's extend-candidates subcommand).
+COPY serverless/runpod_worker/assets/candidates.pkl ./motif/l2/candidates.pkl
+
 # Records the rate the model was trained at, read back by find to resample
 # both search and noise audio to match (see load_training_sample_rate() in
 # motif_discovery.py). `train` writes this next to the model it produces;
