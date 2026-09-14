@@ -76,6 +76,11 @@ Extend mode:
                                     # run_train_candidates()'s docstring for
                                     # why growing-pool extend defaults the
                                     # other way from train-candidates itself.
+    The candidates-building stage also uploads l2_<timestamp>.csv/.wav into
+    the "motif_extend_state" folder -- that cycle's newly-mined regions, in
+    the same starts,stops-into-one-wav format train's own csv_path/wav_path
+    input uses. These accumulate (one dated pair per cycle) rather than
+    being overwritten, unlike candidates.pkl/phmm_extended.pkl.
     Call repeatedly (one job submission per stage) until the response's
     "stage" field reports "find" -- each call only advances the pipeline
     by whichever single stage isn't done yet, so a multi-hour DTW filter +
@@ -761,7 +766,13 @@ def handle_extend(job_input):
          (motif_discovery.py's extract_non_noise_candidates(), via the
          extend-candidates subcommand), combine them with the packaged
          /app/motif/l2/candidates.pkl, upload the result as this job
-         family's candidates.pkl, and stop.
+         family's candidates.pkl, and stop. Also uploads this cycle's new
+         regions as l2_<timestamp>.csv/l2_<timestamp>.wav -- one starts,
+         stops-into-one-wav pair in the same format train's own csv_path/
+         wav_path input uses, so what got mined this cycle stays auditable/
+         reusable on its own, not just buried as embeddings inside
+         candidates.pkl. Accumulates across cycles (never overwritten,
+         unlike candidates.pkl/phmm_extended.pkl).
       B. Candidates exist but no phmm_extended.pkl yet: fit a new profile
          HMM from that combined pool (train-candidates -- same DTW-filter +
          BIC-sweep discovery path `train` uses), upload it, and stop. Needs
@@ -925,6 +936,10 @@ def handle_extend(job_input):
                     dest = os.path.join(embroot, e["stem"])
                     os.makedirs(dest, exist_ok=True)
                     shutil.copy2(e["embeddings_path"], os.path.join(dest, "embeddings.pkl"))
+                    # extend-candidates slices this file's new regions'
+                    # actual audio out of here (when present) to also write
+                    # l2_<timestamp>.csv/.wav -- see its docstring.
+                    shutil.copy2(e["mono_path"], os.path.join(dest, "audio.wav"))
 
                 baked_local = os.path.join(embroot, "baked_candidates.pkl")
                 shutil.copy2(BAKED_CANDIDATES_PATH, baked_local)
@@ -933,6 +948,21 @@ def handle_extend(job_input):
 
                 print(f"Uploading combined candidates to extend state folder: {EXTEND_CANDIDATES_NAME}")
                 upload_file(service, state_folder_id, combined_local, EXTEND_CANDIDATES_NAME)
+
+                # This cycle's freshly-mined regions, in the same
+                # starts,stops-into-one-wav format train's own csv_path/
+                # wav_path input uses -- uploaded alongside (not
+                # overwriting) whatever earlier cycles already wrote, so
+                # they accumulate as a dated history rather than replacing
+                # each other like candidates.pkl/phmm_extended.pkl do.
+                new_candidate_csvs = sorted(Path(embroot).glob("l2_*.csv"))
+                new_candidate_wavs = sorted(Path(embroot).glob("l2_*.wav"))
+                for csv_file in new_candidate_csvs:
+                    print(f"Uploading new-candidates CSV to extend state folder: {csv_file.name}")
+                    upload_file(service, state_folder_id, str(csv_file), csv_file.name, mime_type='text/csv')
+                for wav_file in new_candidate_wavs:
+                    print(f"Uploading new-candidates wav to extend state folder: {wav_file.name}")
+                    upload_file(service, state_folder_id, str(wav_file), wav_file.name, mime_type='audio/wav')
             finally:
                 shutil.rmtree(embroot, ignore_errors=True)
 
