@@ -51,9 +51,9 @@ Extend mode:
     Set "mode": "extend" to run a different, staged pipeline instead of the
     find job above -- see handle_extend()'s docstring for the full stage
     breakdown (embed -> build candidates -> train a new model -> find with
-    it). Same output_gdrive_folder_id/noise_*/require_full_match/
-    pvl_file_id inputs apply (the noise_*/require_full_match/pvl_file_id
-    ones only matter once the pipeline reaches its find stage), plus:
+    it). Same output_gdrive_folder_id/noise_*/require_full_match inputs
+    apply (the noise_*/require_full_match ones only matter once the
+    pipeline reaches its find stage), plus:
         "mode": "extend",
         "gdrive_folder_id": "..." or ["...", "..."],  # one folder id, or a
                                     # list of them -- every file across all
@@ -63,6 +63,17 @@ Extend mode:
                                     # folder_id anchors the state/output
                                     # folders if given, else the first
                                     # listed input folder does.
+        "pvl_file_id": "..." or ["...", null, "..."],  # optional. One id
+                                    # shared by every folder, or a list
+                                    # matched positionally to
+                                    # gdrive_folder_id (use null for a
+                                    # folder with no PVL) -- since folders
+                                    # can span different datasets/years
+                                    # with different shotlogs. Only matters
+                                    # once the pipeline reaches its find
+                                    # stage; a length mismatch against
+                                    # gdrive_folder_id is a hard error, not
+                                    # a silent misalignment.
         "min_region_frames": 10,    # optional, default 10 -- shortest
                                     # contiguous non-NOISE run (in frames)
                                     # to keep as a new training candidate
@@ -527,6 +538,27 @@ def _as_folder_id_list(value):
     return list(value)
 
 
+def _as_pvl_id_list(value, n):
+    """
+    pvl_file_id (extend mode only) accepts: omitted (no PVL for any
+    folder), one id (the same PVL shared across every gdrive_folder_id --
+    e.g. one shotlog covering several encounter folders from the same
+    year), or a list matched positionally to gdrive_folder_id (one PVL --
+    or null for "none" -- per folder, for folders spanning different
+    datasets/years). Always returns a list of length n; raises ValueError
+    on a length mismatch rather than guessing an alignment.
+    """
+    if value is None:
+        return [None] * n
+    if isinstance(value, str):
+        return [value] * n
+    pvl_ids = list(value)
+    if len(pvl_ids) != n:
+        raise ValueError(f"pvl_file_id has {len(pvl_ids)} entries but gdrive_folder_id has {n} -- "
+                          f"give one pvl_file_id per folder (or a single id to share across all)")
+    return pvl_ids
+
+
 def read_training_sample_rate(metadata_path):
     """
     Same convention as motif_discovery.py's load_training_sample_rate(),
@@ -794,8 +826,12 @@ def handle_extend(job_input):
         output_gdrive_folder_id  -- same meaning as find's
         min_region_frames    -- default 10, see extend-candidates' own flag
         all_medoids           -- default True, see run_train_candidates()
-        noise_components, noise_var_scale, hit_gap_seconds, require_full_match,
-        pvl_file_id           -- same meaning as find's, used only at the find stage
+        noise_components, noise_var_scale, hit_gap_seconds, require_full_match
+                              -- same meaning as find's, used only at the find stage
+        pvl_file_id           -- one id shared by every folder, or a list matched
+                                 positionally to gdrive_folder_id (null for a
+                                 folder with no PVL); see _as_pvl_id_list(). Also
+                                 only matters at the find stage.
 
     Returns a dict with a "stage" field (candidates_built / model_trained /
     find) so the caller knows what just happened and what a follow-up
@@ -814,7 +850,11 @@ def handle_extend(job_input):
     # See run_train_candidates()'s docstring for why this defaults to True
     # here specifically (unlike train-candidates' own CLI default).
     all_medoids = bool(job_input.get('all_medoids', True))
-    pvl_file_id = job_input.get('pvl_file_id')
+    try:
+        pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
+    except ValueError as e:
+        return {"error": str(e)}
+    folder_to_pvl_id = dict(zip(gdrive_folder_ids, pvl_ids_by_folder))
 
     service = get_drive_service()
     # output_gdrive_folder_id, or the first input folder if not given -- same
@@ -826,7 +866,10 @@ def handle_extend(job_input):
     files = []
     for folder_id in gdrive_folder_ids:
         folder_files = list_audio_files(service, folder_id)
-        print(f"  {folder_id}: {len(folder_files)} audio files")
+        print(f"  {folder_id}: {len(folder_files)} audio files "
+              f"(pvl_file_id={folder_to_pvl_id[folder_id] or 'none'})")
+        for f in folder_files:
+            f['_source_folder_id'] = folder_id  # carried through to embedded[]'s pvl_file_id below
         files.extend(folder_files)
     if not files:
         return {"error": "No WAV/M4A files found in the specified Google Drive folder(s)"}
@@ -925,6 +968,7 @@ def handle_extend(job_input):
             embedded.append({
                 "file_info": file_info, "stem": stem, "work_dir": work_dir,
                 "output_path": output_path, "embeddings_path": embeddings_path, "mono_path": mono_path,
+                "pvl_file_id": folder_to_pvl_id.get(file_info.get('_source_folder_id')),
             })
 
         # ---- Stage: no combined candidates.pkl yet -> build one ----
@@ -976,7 +1020,7 @@ def handle_extend(job_input):
         # ---- Stage: model exists -> find against every file + annotate ----
         print(f"\n{EXTEND_MODEL_NAME} exists -- running find against all recordings")
         model_work_dir = tempfile.mkdtemp(prefix='motif_extend_model_')
-        pvl_path, pvl_work_dir = None, None
+        pvl_work_dir = None
         try:
             model_local = os.path.join(model_work_dir, EXTEND_MODEL_NAME)
             download_file(service, model_id, model_local)
@@ -984,14 +1028,23 @@ def handle_extend(job_input):
             if metadata_id:
                 download_file(service, metadata_id, os.path.join(model_work_dir, EXTEND_TRAINING_METADATA_NAME))
 
-            if pvl_file_id:
+            # Distinct PVL ids only, downloaded once each -- multiple
+            # folders may share the same PVL (or none at all). Keyed by
+            # pvl_file_id so each file below can look up the one that
+            # matches its own source folder (see folder_to_pvl_id above).
+            distinct_pvl_ids = sorted({pid for pid in pvl_ids_by_folder if pid})
+            pvl_paths_by_id = {}
+            if distinct_pvl_ids:
                 pvl_work_dir = tempfile.mkdtemp(prefix='motif_extend_pvl_')
-                pvl_path = os.path.join(pvl_work_dir, 'pvl.xlsx')
-                try:
-                    download_file(service, pvl_file_id, pvl_path)
-                except Exception as e:
-                    print(f"WARNING: failed to download PVL file ({e}) -- skipping annotation for this job")
-                    pvl_path = None
+                for idx, pid in enumerate(distinct_pvl_ids):
+                    local_path = os.path.join(pvl_work_dir, f'pvl_{idx}.xlsx')
+                    print(f"Downloading PVL file: {pid}")
+                    try:
+                        download_file(service, pid, local_path)
+                        pvl_paths_by_id[pid] = local_path
+                    except Exception as e:
+                        print(f"WARNING: failed to download PVL file {pid} ({e}) -- "
+                              f"skipping annotation for its folder(s)")
 
             timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
             output_folder_name = f"motif_extend_find_{timestamp}"
@@ -1007,6 +1060,7 @@ def handle_extend(job_input):
                     run_find(e["mono_path"], e["output_path"], noise_components, noise_var_scale,
                              hit_gap_seconds, require_full_match=require_full_match, model_path=model_local)
                     hits = count_hits(os.path.join(e["output_path"], "motif_hits.csv"))
+                    pvl_path = pvl_paths_by_id.get(e["pvl_file_id"])
                     if pvl_path:
                         try:
                             encounter = encounter_from_filename(stem)
