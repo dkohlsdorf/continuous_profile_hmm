@@ -3,7 +3,7 @@ import heapq
 
 
 def euc(x, y):
-    return np.sqrt(np.sum(np.pow(x-y, 2)))
+    return np.sqrt(np.sum((x - y) ** 2))
 
 
 def distance_profile(sequence, smooth_window=[1,1,1]):
