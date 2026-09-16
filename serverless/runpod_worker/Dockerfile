@@ -28,6 +28,16 @@ ENV OMP_NUM_THREADS=4
 ENV MKL_NUM_THREADS=4
 ENV OPENBLAS_NUM_THREADS=4
 
+# Companion fix to the thread caps above: capping thread *count* doesn't
+# stop glibc from handing each thread its own malloc arena the first time
+# it allocates, and arenas aren't reclaimed when the thread pool tears
+# down -- so RSS can still ratchet up across tens of thousands of
+# spin-up/tear-down cycles even at 4 threads each. Forcing everything
+# through one arena (the pre-glibc-2.10 default) trades a little
+# allocator contention for bounded memory here, which is the right
+# tradeoff for this single-process-per-window workload.
+ENV MALLOC_ARENA_MAX=1
+
 WORKDIR /app
 
 # build-essential/g++/gcc: compiling lib_phmm's pybind11 C++ extensions.
