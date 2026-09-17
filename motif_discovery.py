@@ -657,10 +657,10 @@ def fit_model_from_candidates(candidates, args):
     on the winning trial.
 
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
-    Reads dtw_warping_band/dtw_epochs/all_medoids/max_match/
-    flank_dwell_frames/flank_alpha/require_full_match off of args --
-    train_parser and train_candidates_parser both define all of these
-    with the same names.
+    Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/
+    all_medoids/max_match/flank_dwell_frames/flank_alpha/require_full_match
+    off of args -- train_parser and train_candidates_parser both define
+    all of these with the same names.
     """
     lengths = [len(embedding) for embedding, _, _ in candidates]
     mean_len, median_len, max_len = float(np.mean(lengths)), float(np.median(lengths)), int(np.max(lengths))
@@ -676,8 +676,11 @@ def fit_model_from_candidates(candidates, args):
         candidates,
         warping_band=args.dtw_warping_band,
         epochs=args.dtw_epochs,
+        restarts=args.dtw_restarts,
+        tolerance=args.dtw_density_tolerance,
     )
-    print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids")
+    print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
+          f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance})")
     n_filtered = len(filtered)
 
     print("==========================================")
@@ -1335,6 +1338,8 @@ if __name__ == "__main__":
     train_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
     train_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
+    train_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
+    train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
     train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
@@ -1377,6 +1382,8 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally. Only n_match_states is still BIC-picked.")
     train_candidates_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
+    train_candidates_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
+    train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
     train_candidates_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup)")

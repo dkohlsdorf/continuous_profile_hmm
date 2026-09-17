@@ -28,14 +28,15 @@ public:
   // `instances`, stopping a branch once splitting it further would not
   // produce a denser (tighter) pair of children than the branch itself,
   // then returns the leaf medoids -- an empty `instances` clusters every
-  // sequence in the dataset.
-  std::vector<int> kmedoids(std::vector<int> instances, int epochs) {
+  // sequence in the dataset. restarts/tolerance default to the same
+  // values hierarchical_kmedian_dtw.hpp itself defaults to.
+  std::vector<int> kmedoids(std::vector<int> instances, int epochs, int restarts, double tolerance) {
     if (instances.empty()) {
       instances.resize(impl.size());
       for (int i = 0; i < impl.size(); i++) instances[i] = i;
     }
     std::set<int> medoids;
-    ::kmedoids(impl, instances, medoids, epochs, 0.0);
+    ::kmedoids(impl, instances, medoids, epochs, 0.0, restarts, tolerance);
     return std::vector<int>(medoids.begin(), medoids.end());
   }
 
@@ -61,10 +62,15 @@ PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
     .def("size", &DistanceManager::size)
     .def("kmedoids", &DistanceManager::kmedoids,
          py::arg("instances") = std::vector<int>{}, py::arg("epochs") = 20,
+         py::arg("restarts") = KMEDOIDS_RESTARTS_DEFAULT, py::arg("tolerance") = DENSITY_TOLERANCE_DEFAULT,
          "Divisively cluster `instances` (dataset indices; empty = all) by "
          "DTW distance, splitting in two by k-medoids each level, recursing "
          "into a child only while it is denser (tighter around its medoid) "
-         "than its parent -- no external threshold needed, the split count "
-         "is entirely data-driven. Returns the resulting leaf medoids as "
-         "dataset indices.");
+         "than its parent -- no external distance/count threshold needed, "
+         "the split count is entirely data-driven. `restarts` random "
+         "(anchor, sample) attempts are tried per split and the densest is "
+         "kept; `tolerance` is the fractional slack allowed below the "
+         "parent's density before a branch stops (0.05 = a child up to 5% "
+         "less dense than its parent still keeps splitting). Returns the "
+         "resulting leaf medoids as dataset indices.");
 }

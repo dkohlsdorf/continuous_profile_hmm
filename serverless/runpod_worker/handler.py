@@ -77,7 +77,7 @@ Extend mode:
         "min_region_frames": 10,    # optional, default 10 -- shortest
                                     # contiguous non-NOISE run (in frames)
                                     # to keep as a new training candidate
-        "all_medoids": true         # optional, default true (NOT
+        "all_medoids": true,        # optional, default true (NOT
                                     # train-candidates' own CLI default) --
                                     # every DTW-filtered candidate becomes
                                     # its own sub-model directly, skipping
@@ -87,6 +87,17 @@ Extend mode:
                                     # run_train_candidates()'s docstring for
                                     # why growing-pool extend defaults the
                                     # other way from train-candidates itself.
+        "dtw_restarts": 10,          # optional, default: train-candidates'
+                                    # own CLI default (10) -- random splits
+                                    # tried per k-medoids level, keeping the
+                                    # densest. See hierarchical_kmedian_dtw
+                                    # .hpp's KMEDOIDS_RESTARTS_DEFAULT.
+        "dtw_density_tolerance": 0.05  # optional, default: train-candidates'
+                                    # own CLI default (0.05) -- how much less
+                                    # dense than its parent a branch may
+                                    # still be and keep splitting (higher ->
+                                    # more, finer medoids). See
+                                    # DENSITY_TOLERANCE_DEFAULT there.
     The candidates-building stage also uploads l2_<timestamp>.csv/.wav into
     the "motif_extend_state" folder -- that cycle's newly-mined regions, in
     the same starts,stops-into-one-wav format train's own csv_path/wav_path
@@ -125,6 +136,15 @@ Embeddings cache:
     folders rather than inside one, so it survives across runs. Set
     use_embeddings_cache=false to force a fresh decode (e.g. after changing
     the embedding model itself, which the cache can't detect).
+
+    The packaged --noise-wav's own embeddings are cached the same way, as
+    a single NOISE_EMBEDDINGS_CACHE_NAME entry in this same Drive folder
+    (see restore_noise_embeddings()/save_noise_embeddings()) -- it's a
+    fixed, never-changing asset, so this decode happens once ever across
+    every job/container from here on, not once per job or once per
+    recording. Bump NOISE_EMBEDDINGS_CACHE_VERSION if the packaged noise
+    wav itself, or what gets written into noise_embeddings.pkl, ever
+    changes.
 
 Output:
     {
@@ -178,13 +198,12 @@ EXTEND_MODEL_NAME = "phmm_extended.pkl"
 EXTEND_TRAINING_METADATA_NAME = "training_metadata.json"
 
 # motif_hits.csv + submodel_<n>_hits.wav are this run's deliverables.
-# embeddings.pkl goes to the persistent Drive cache folder instead (see
-# EMBEDDINGS_CACHE_FOLDER_NAME), not into the timestamped results folder --
-# a results folder is per-run, so a copy there could never be found again
-# by a later run looking to skip decoding. noise_embeddings.pkl is
-# find_in_file()'s own same-run cache for the packaged --noise-wav (see
-# motif_discovery.py's build_noise_model() docstring) -- meaningless
-# outside this container, since assets/naive_noise.wav isn't on Drive.
+# embeddings.pkl and noise_embeddings.pkl both go to the persistent Drive
+# cache folder instead (see EMBEDDINGS_CACHE_FOLDER_NAME/
+# NOISE_EMBEDDINGS_CACHE_NAME, restore_noise_embeddings()/
+# save_noise_embeddings()), not into the timestamped results folder -- a
+# results folder is per-run, so a copy there could never be found again by
+# a later run looking to skip decoding.
 UPLOAD_SKIP_NAMES = {"embeddings.pkl", "noise_embeddings.pkl"}
 
 # Persistent (NOT per-run/timestamped) Drive folder holding one
@@ -209,6 +228,18 @@ EMBEDDINGS_CACHE_VERSION = "v2"
 # container-local path after the first file and copying it back in for
 # every subsequent one keeps that decode to once per job.
 NOISE_EMBEDDINGS_CACHE_PATH = "/app/work/noise_embeddings.pkl"
+
+# Drive-persisted counterpart of NOISE_EMBEDDINGS_CACHE_PATH -- lives in the
+# same motif_embeddings_cache folder find's own per-recording embeddings
+# use (see EMBEDDINGS_CACHE_FOLDER_NAME), so it survives across separate
+# job submissions/cold containers too, not just within one already-warm
+# job. Versioned the same way as EMBEDDINGS_CACHE_VERSION: bump this if
+# what build_noise_model() writes into noise_embeddings.pkl ever changes
+# shape, or if the packaged noise wav / its target sample rate changes --
+# a bump makes the old Drive entry simply invisible rather than silently
+# reused.
+NOISE_EMBEDDINGS_CACHE_VERSION = "v1"
+NOISE_EMBEDDINGS_CACHE_NAME = f"noise_embeddings.{NOISE_EMBEDDINGS_CACHE_VERSION}.pkl"
 
 
 
@@ -604,7 +635,8 @@ def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidat
     ], 'extend-candidates')
 
 
-def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True):
+def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
+                          dtw_restarts=None, dtw_density_tolerance=None):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -614,6 +646,13 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
     otherwise runs is exactly the cost that scales worst as that pool grows
     -- --all-medoids instead makes every DTW-filtered candidate its own
     sub-model directly, BIC-picking only n_match_states.
+
+    dtw_restarts/dtw_density_tolerance forward to train-candidates'
+    --dtw-restarts/--dtw-density-tolerance (see hierarchical_kmedian_dtw.hpp's
+    KMEDOIDS_RESTARTS_DEFAULT/DENSITY_TOLERANCE_DEFAULT for what they
+    control) -- None (the default) omits the flag entirely so
+    motif_discovery.py's own CLI default applies, unchanged from before
+    these existed.
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
@@ -624,6 +663,10 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
     ]
     if all_medoids:
         cmd.append('--all-medoids')
+    if dtw_restarts is not None:
+        cmd += ['--dtw-restarts', str(dtw_restarts)]
+    if dtw_density_tolerance is not None:
+        cmd += ['--dtw-density-tolerance', str(dtw_density_tolerance)]
     _stream_subprocess(cmd, 'train-candidates')
 
 
@@ -635,35 +678,78 @@ def count_hits(motif_hits_csv):
         return max(0, sum(1 for _ in f) - 1)
 
 
-def restore_noise_embeddings(output_path):
+def restore_noise_embeddings(output_path, service=None, embeddings_cache_folder_id=None):
     """
-    Copy the job-local noise_embeddings.pkl (if a previous file in this job
-    already produced one) into output_path, so build_noise_model() loads it
-    instead of re-embedding the packaged noise wav from scratch.
+    Seed output_path/noise_embeddings.pkl so build_noise_model() loads it
+    instead of re-embedding the packaged, never-changing noise wav from
+    scratch. Two layers, cheapest first:
+      1. The job-local NOISE_EMBEDDINGS_CACHE_PATH, if an earlier file in
+         this same job already produced one.
+      2. The persistent Drive cache (embeddings_cache_folder_id, the same
+         motif_embeddings_cache folder find's own per-recording embeddings
+         use), if a *prior job* already cached one there -- this is what
+         makes the very first file of a cold container skip re-embedding
+         too. Found-on-Drive also re-seeds the local cache, so later files
+         in this job hit layer 1 instead of Drive again.
 
-    Best-effort: this is purely a speedup, so a broken/unwritable cache must
-    never take down the actual run -- worst case find re-embeds the noise.
+    service/embeddings_cache_folder_id are optional -- omit either to skip
+    straight to a local-only lookup (e.g. a caller with no Drive context).
+
+    Best-effort throughout: this is purely a speedup, so a broken/
+    unwritable/unreachable cache must never take down the actual run --
+    worst case find re-embeds the noise.
     """
     try:
         if os.path.exists(NOISE_EMBEDDINGS_CACHE_PATH):
             shutil.copy2(NOISE_EMBEDDINGS_CACHE_PATH, os.path.join(output_path, 'noise_embeddings.pkl'))
             print("  Reusing noise embeddings from this job's earlier file")
+            return
     except OSError as e:
-        print(f"  (noise embedding cache unreadable, re-embedding: {e})")
+        print(f"  (local noise embeddings cache unreadable, trying Drive: {e})")
+
+    if service is None or embeddings_cache_folder_id is None:
+        return
+    try:
+        cached_id = find_file(service, embeddings_cache_folder_id, NOISE_EMBEDDINGS_CACHE_NAME)
+        if not cached_id:
+            return
+        print(f"  Using cached noise embeddings from Drive: {NOISE_EMBEDDINGS_CACHE_NAME}")
+        dest = os.path.join(output_path, 'noise_embeddings.pkl')
+        download_file(service, cached_id, dest)
+        os.makedirs(os.path.dirname(NOISE_EMBEDDINGS_CACHE_PATH), exist_ok=True)
+        shutil.copy2(dest, NOISE_EMBEDDINGS_CACHE_PATH)
+    except Exception as e:
+        print(f"  (Drive noise embeddings cache fetch failed, re-embedding: {e})")
 
 
-def save_noise_embeddings(output_path):
+def save_noise_embeddings(output_path, service=None, embeddings_cache_folder_id=None):
     """
-    Stash this run's noise_embeddings.pkl for the job's remaining files.
-    Best-effort, for the same reason as restore_noise_embeddings().
+    Stash this run's noise_embeddings.pkl (produced because restore_noise_
+    embeddings() found nothing cached anywhere) both job-locally, for this
+    job's remaining files, and to the persistent Drive cache, so the next
+    job/cold container skips re-embedding the noise wav too. Best-effort,
+    for the same reason as restore_noise_embeddings(); service/
+    embeddings_cache_folder_id optional the same way.
     """
     produced = os.path.join(output_path, 'noise_embeddings.pkl')
-    try:
-        if os.path.exists(produced) and not os.path.exists(NOISE_EMBEDDINGS_CACHE_PATH):
+    if not os.path.exists(produced):
+        return
+
+    if not os.path.exists(NOISE_EMBEDDINGS_CACHE_PATH):
+        try:
             os.makedirs(os.path.dirname(NOISE_EMBEDDINGS_CACHE_PATH), exist_ok=True)
             shutil.copy2(produced, NOISE_EMBEDDINGS_CACHE_PATH)
-    except OSError as e:
-        print(f"  (could not stash noise embeddings, next file will re-embed: {e})")
+        except OSError as e:
+            print(f"  (could not stash noise embeddings locally, next file will re-embed: {e})")
+
+    if service is None or embeddings_cache_folder_id is None:
+        return
+    try:
+        if not find_file(service, embeddings_cache_folder_id, NOISE_EMBEDDINGS_CACHE_NAME):
+            print(f"  Caching noise embeddings to Drive: {NOISE_EMBEDDINGS_CACHE_NAME}")
+            upload_file(service, embeddings_cache_folder_id, produced, NOISE_EMBEDDINGS_CACHE_NAME)
+    except Exception as e:
+        print(f"  (caching noise embeddings to Drive failed, will re-embed next job: {e})")
 
 
 def process_one_file(service, file_info, run_output_folder_id, noise_components, noise_var_scale,
@@ -725,13 +811,13 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
         print(f"  Converting to mono (first channel): {name}")
         convert_to_mono_first_channel(raw_path, mono_path)
 
-        restore_noise_embeddings(output_path)
+        restore_noise_embeddings(output_path, service, embeddings_cache_folder_id)
 
         print(f"  Running find: {name}")
         run_find(mono_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
                  require_full_match=require_full_match)
 
-        save_noise_embeddings(output_path)
+        save_noise_embeddings(output_path, service, embeddings_cache_folder_id)
 
         hits = count_hits(os.path.join(output_path, 'motif_hits.csv'))
 
@@ -829,6 +915,11 @@ def handle_extend(job_input):
         output_gdrive_folder_id  -- same meaning as find's
         min_region_frames    -- default 10, see extend-candidates' own flag
         all_medoids           -- default True, see run_train_candidates()
+        dtw_restarts, dtw_density_tolerance -- optional, forwarded to
+                                 train-candidates' --dtw-restarts/
+                                 --dtw-density-tolerance (omitted, using
+                                 motif_discovery.py's own CLI defaults, when
+                                 not given); see run_train_candidates()
         noise_components, noise_var_scale, hit_gap_seconds, require_full_match
                               -- same meaning as find's, used only at the find stage
         pvl_file_id           -- one id shared by every folder, or a list matched
@@ -855,6 +946,10 @@ def handle_extend(job_input):
     # See run_train_candidates()'s docstring for why this defaults to True
     # here specifically (unlike train-candidates' own CLI default).
     all_medoids = bool(job_input.get('all_medoids', True))
+    dtw_restarts = job_input.get('dtw_restarts')
+    dtw_restarts = int(dtw_restarts) if dtw_restarts is not None else None
+    dtw_density_tolerance = job_input.get('dtw_density_tolerance')
+    dtw_density_tolerance = float(dtw_density_tolerance) if dtw_density_tolerance is not None else None
     try:
         pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
     except ValueError as e:
@@ -998,7 +1093,8 @@ def handle_extend(job_input):
                 download_file(service, candidates_id, candidates_local)
                 train_output = os.path.join(train_work_dir, 'output')
                 os.makedirs(train_output, exist_ok=True)
-                run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids)
+                run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
+                                      dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
@@ -1054,9 +1150,14 @@ def handle_extend(job_input):
                 stem = e["stem"]
                 print(f"\n[{i + 1}/{len(embedded)}] {name}")
                 try:
+                    restore_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
+
                     print(f"  Running find: {name}")
                     run_find(e["mono_path"], e["output_path"], noise_components, noise_var_scale,
                              hit_gap_seconds, require_full_match=require_full_match, model_path=model_local)
+
+                    save_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
+
                     hits = count_hits(os.path.join(e["output_path"], "motif_hits.csv"))
                     pvl_path = pvl_paths_by_id.get(e["pvl_file_id"])
                     if pvl_path:

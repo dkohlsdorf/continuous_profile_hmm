@@ -144,15 +144,16 @@ inline pair<int, double> select_medoid(int medoid, double current_avg, vector<in
 // 1-2 levels almost everywhere. Trying several random restarts and
 // keeping the densest split makes that per-level roll far less luck-
 // dependent, without reintroducing an external distance/count threshold.
-const int KMEDOIDS_RESTARTS = 10;
+const int KMEDOIDS_RESTARTS_DEFAULT = 10;
 
 // A child only marginally less dense than its parent (e.g. from one
 // restart's random assignment noise) shouldn't permanently give up on
 // that whole branch -- allow it to keep splitting as long as it's within
 // this fraction of the parent's density.
-const double DENSITY_TOLERANCE = 0.05;
+const double DENSITY_TOLERANCE_DEFAULT = 0.05;
 
-inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &medoids, int epochs, double parent_density) {
+inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &medoids, int epochs, double parent_density,
+		      int restarts = KMEDOIDS_RESTARTS_DEFAULT, double tolerance = DENSITY_TOLERANCE_DEFAULT) {
   int n = instances.size();
   if(n <= 2) {
     medoids.insert(instances.begin(), instances.end());
@@ -168,7 +169,7 @@ inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &me
   vector<int> best_anchor_inst, best_sample_inst;
   double best_score = -INFINITY;
 
-  for(int restart = 0; restart < KMEDOIDS_RESTARTS; restart++) {
+  for(int restart = 0; restart < restarts; restart++) {
     int anchor = instances[dist(gen)];
     int sample = sample_medoid(x, instances, anchor, gen);
 
@@ -230,15 +231,15 @@ inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &me
     }
   }
 
-  double tolerant_parent_density = parent_density * (1.0 - DENSITY_TOLERANCE);
+  double tolerant_parent_density = parent_density * (1.0 - tolerance);
 
   if(best_anchor_density > tolerant_parent_density) {
-    kmedoids(x, best_anchor_inst, medoids, epochs, best_anchor_density);
+    kmedoids(x, best_anchor_inst, medoids, epochs, best_anchor_density, restarts, tolerance);
   } else {
     medoids.insert(best_anchor);
   }
   if(best_sample_density > tolerant_parent_density) {
-    kmedoids(x, best_sample_inst, medoids, epochs, best_sample_density);
+    kmedoids(x, best_sample_inst, medoids, epochs, best_sample_density, restarts, tolerance);
   } else {
     medoids.insert(best_sample);
   }
