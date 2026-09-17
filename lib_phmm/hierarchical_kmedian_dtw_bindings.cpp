@@ -25,16 +25,17 @@ public:
 
   // Divisive hierarchical k-medoids/k-median clustering under DTW distance
   // (see kmedoids() in hierarchical_kmedian_dtw.hpp). Recursively bisects
-  // `instances` until each leaf's average intra-cluster distance drops
-  // below `threshold`, then returns the leaf medoids -- an empty
-  // `instances` clusters every sequence in the dataset.
-  std::vector<int> kmedoids(std::vector<int> instances, int epochs, double threshold) {
+  // `instances`, stopping a branch once splitting it further would not
+  // produce a denser (tighter) pair of children than the branch itself,
+  // then returns the leaf medoids -- an empty `instances` clusters every
+  // sequence in the dataset.
+  std::vector<int> kmedoids(std::vector<int> instances, int epochs) {
     if (instances.empty()) {
       instances.resize(impl.size());
       for (int i = 0; i < impl.size(); i++) instances[i] = i;
     }
     std::set<int> medoids;
-    ::kmedoids(impl, instances, medoids, epochs, threshold);
+    ::kmedoids(impl, instances, medoids, epochs, 0.0);
     return std::vector<int>(medoids.begin(), medoids.end());
   }
 
@@ -59,9 +60,11 @@ PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
          "Cached DTW distance between dataset[i] and dataset[j].")
     .def("size", &DistanceManager::size)
     .def("kmedoids", &DistanceManager::kmedoids,
-         py::arg("instances") = std::vector<int>{}, py::arg("epochs") = 20, py::arg("threshold") = 0.0,
+         py::arg("instances") = std::vector<int>{}, py::arg("epochs") = 20,
          "Divisively cluster `instances` (dataset indices; empty = all) by "
-         "DTW distance, splitting in two by k-medoids each level until a "
-         "branch's average intra-cluster distance to its medoid is below "
-         "`threshold`. Returns the resulting leaf medoids as dataset indices.");
+         "DTW distance, splitting in two by k-medoids each level, recursing "
+         "into a child only while it is denser (tighter around its medoid) "
+         "than its parent -- no external threshold needed, the split count "
+         "is entirely data-driven. Returns the resulting leaf medoids as "
+         "dataset indices.");
 }

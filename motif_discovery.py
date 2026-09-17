@@ -12,7 +12,8 @@ Two subcommands:
        candidate boundaries are already given, so every analysis window
        inside [start, stop) is kept)
     2. thin the candidate pool with DTW hierarchical k-medoid filtering
-       down to --keep-fraction of the original candidates
+       (density-driven, stops splitting a branch once its children stop
+       getting tighter -- no target count/fraction to set)
     3. run the same BIC-driven match-state / sub-model sweep used by
        processing.py to fit a profile HMM on the filtered pool
     4. decode every candidate (the full, unfiltered pool) against the
@@ -105,7 +106,6 @@ import datetime
 import json
 import math
 import os
-import random
 import time
 import wave
 import pickle as pkl
@@ -133,10 +133,9 @@ torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
 from lib_phmm.signals import load_filtered_waveform, process, classify
-from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean
+from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
-import lib_phmm.hierarchical_kmedian_dtw as hkd
 
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 
@@ -308,66 +307,12 @@ def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=Non
     return embeddings, classifications, step_samples, sample_rate
 
 
-def filter_by_keep_fraction(candidates, keep_fraction, warping_band, epochs,
-                             n_samples=500, max_search_iters=15, seed=None):
-    """
-    hierarchical_kmedian_dtw's kmedoids() is threshold-driven, not
-    count-driven, so --keep-fraction is hit by bisecting the threshold,
-    expressed as a percentile of sampled pairwise DTW distances: a
-    higher threshold makes branches stop splitting sooner -> fewer
-    medoids kept, a lower threshold -> more medoids kept.
-
-    kmedoids' internal anchor/second-seed choice is randomized
-    (unseeded, on the C++ side), so the count-vs-threshold relationship
-    is only approximately monotonic -- this keeps the closest-to-target
-    result seen across the search rather than assuming the last
-    bisection step is the best one.
-    """
-    dataset = [[[float(v) for v in frame] for frame in region_embeddings]
-               for region_embeddings, _, _ in candidates]
-    n = len(dataset)
-    target = max(1, round(n * keep_fraction))
-
-    dm = hkd.DistanceManager(dataset, warping_band)
-
-    rng = random.Random(seed)
-    max_pairs = n * (n - 1) // 2
-    n_samples = min(n_samples, max_pairs)
-    pairs = set()
-    while len(pairs) < n_samples:
-        i, j = rng.randrange(n), rng.randrange(n)
-        if i != j:
-            pairs.add((min(i, j), max(i, j)))
-    sampled_distances = sorted(dm.distance(i, j) for i, j in pairs)
-
-    lo, hi = 0.0, 100.0
-    best_ids, best_gap, trace = None, float('inf'), []
-    for _ in range(max_search_iters):
-        mid = (lo + hi) / 2
-        threshold = float(np.percentile(sampled_distances, mid))
-        medoid_ids = dm.kmedoids([], epochs, threshold)
-        gap = len(medoid_ids) - target
-        trace.append({"percentile": mid, "threshold": threshold, "n_kept": len(medoid_ids)})
-
-        if abs(gap) < abs(best_gap):
-            best_ids, best_gap = medoid_ids, gap
-        if gap == 0:
-            break
-        if len(medoid_ids) > target:
-            lo = mid   # too many kept -> raise the threshold -> more merging
-        else:
-            hi = mid   # too few kept -> lower the threshold -> less merging
-
-    kept = [candidates[i] for i in best_ids]
-    return kept, trace
-
-
 def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
     """
     max_match caps how many sub-models sweep_one_state_count() may
     greedily add (BIC then picks how many of those to actually keep).
     Cost is roughly O(max_match * candidates^2) per n_match_states value
-    -- see sweep_one_state_count()/filter_by_keep_fraction()'s
+    -- see sweep_one_state_count()/filter_candidates_by_medoid()'s
     docstrings -- so raising it much past the default scales the whole
     sweep accordingly, not just this one knob.
 
@@ -708,14 +653,14 @@ def fit_model_from_candidates(candidates, args):
     """
     DTW-filter + BIC-sweep discovery path shared by `train` (its "no
     cached model" branch) and `train-candidates` (always runs this):
-    filter_by_keep_fraction() -> sweep()/sweep_all_medoids() -> make_hmm()
+    filter_candidates_by_medoid() -> sweep()/sweep_all_medoids() -> make_hmm()
     on the winning trial.
 
-    Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered,
-    trace). Reads keep_fraction/dtw_warping_band/dtw_epochs/dtw_threshold_
-    samples/all_medoids/max_match/flank_dwell_frames/flank_alpha/
-    require_full_match off of args -- train_parser and
-    train_candidates_parser both define all of these with the same names.
+    Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
+    Reads dtw_warping_band/dtw_epochs/all_medoids/max_match/
+    flank_dwell_frames/flank_alpha/require_full_match off of args --
+    train_parser and train_candidates_parser both define all of these
+    with the same names.
     """
     lengths = [len(embedding) for embedding, _, _ in candidates]
     mean_len, median_len, max_len = float(np.mean(lengths)), float(np.median(lengths)), int(np.max(lengths))
@@ -727,16 +672,12 @@ def fit_model_from_candidates(candidates, args):
     print("==========================================")
     print("DTW hierarchical k-medoid filtering        ")
     print("==========================================")
-    filtered, trace = filter_by_keep_fraction(
+    filtered = filter_candidates_by_medoid(
         candidates,
-        keep_fraction=args.keep_fraction,
         warping_band=args.dtw_warping_band,
         epochs=args.dtw_epochs,
-        n_samples=args.dtw_threshold_samples,
     )
-    target = round(len(candidates) * args.keep_fraction)
-    print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
-          f"(target {args.keep_fraction:.0%} = {target})")
+    print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids")
     n_filtered = len(filtered)
 
     print("==========================================")
@@ -756,7 +697,7 @@ def fit_model_from_candidates(candidates, args):
     n_models = len(hmm.pdf)
     print(f"selected n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f}")
 
-    return hmm, n_states, n_models, best, flank_dwell_frames, n_filtered, trace
+    return hmm, n_states, n_models, best, flank_dwell_frames, n_filtered
 
 
 def score_candidates(candidates, hmm, n_states, n_models, best, n_filtered, output_path, args, dt):
@@ -850,18 +791,13 @@ def run_train(args):
         }
         n_filtered = model_record.get("n_candidates_filtered")
         flank_dwell_frames = model_record.get("flank_dwell_frames")
-        trace = None
         print(f"Loaded model from: {model_path} "
               f"(n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f})")
     else:
-        hmm, n_states, n_models, best, flank_dwell_frames, n_filtered, trace = fit_model_from_candidates(candidates, args)
+        hmm, n_states, n_models, best, flank_dwell_frames, n_filtered = fit_model_from_candidates(candidates, args)
 
     scores_norm, paths, well_fits = score_candidates(candidates, hmm, n_states, n_models, best, n_filtered,
                                                       output_path, args, dt)
-
-    if trace is not None:
-        with open(output_path / "filter_trace.json", "w") as f:
-            json.dump(trace, f, indent=2)
 
     print("==========================================")
     print("Sub-model assignments                      ")
@@ -893,7 +829,6 @@ def run_train(args):
             "bic": best["bic"],
             "csv_path": str(args.csv_path),
             "wav_path": str(args.wav_path),
-            "keep_fraction": args.keep_fraction,
             "n_candidates_total": len(candidates),
             "n_candidates_filtered": n_filtered,
             "max_match": args.max_match,
@@ -1358,12 +1293,9 @@ def run_train_candidates(args):
     save_training_metadata(output_path, args.sample_rate, args.candidates_path)
 
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    hmm, n_states, n_models, best, flank_dwell_frames, n_filtered, trace = fit_model_from_candidates(candidates, args)
+    hmm, n_states, n_models, best, flank_dwell_frames, n_filtered = fit_model_from_candidates(candidates, args)
     scores_norm, paths, well_fits = score_candidates(candidates, hmm, n_states, n_models, best, n_filtered,
                                                       output_path, args, dt)
-
-    with open(output_path / "filter_trace.json", "w") as f:
-        json.dump(trace, f, indent=2)
 
     model_record = {
         "hmm": hmm,
@@ -1373,7 +1305,6 @@ def run_train_candidates(args):
         "n_sub_models": best["n_sub_models"],
         "bic": best["bic"],
         "candidates_path": str(args.candidates_path),
-        "keep_fraction": args.keep_fraction,
         "n_candidates_total": len(candidates),
         "n_candidates_filtered": n_filtered,
         "max_match": args.max_match,
@@ -1400,12 +1331,10 @@ if __name__ == "__main__":
     train_parser.add_argument("wav_path", help="wav file the CSV offsets index into")
     train_parser.add_argument("output_path", help="output directory for the model pickle and statistics")
     train_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl). If it already exists, it's loaded instead of recomputing DTW filtering + the sweep.")
-    train_parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
     train_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
     train_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
     train_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
-    train_parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
     train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
@@ -1444,12 +1373,10 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("output_path", help="output directory for the model pickle and statistics")
     train_candidates_parser.add_argument("--sample-rate", type=int, required=True, help="the rate these candidates were embedded at -- written into training_metadata.json next to the model so a later `find` resamples search audio to match (there's no single source wav to read this from, unlike `train`)")
     train_candidates_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_extended.pkl)")
-    train_candidates_parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
     train_candidates_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Ignored if --all-medoids is set.")
     train_candidates_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally. Only n_match_states is still BIC-picked.")
     train_candidates_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
-    train_candidates_parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
     train_candidates_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup)")

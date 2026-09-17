@@ -74,6 +74,21 @@ public:
     return store[i][j];
   }
 
+  double density(int anchor, vector<int> instances) {
+    if(instances.empty()) {
+      return 0.0;
+    }
+    double total = 0.0;
+    for(int i = 0; i < instances.size(); i++) {
+      total += this -> distance(instances[i], anchor);
+    }
+    double avg_distance = total / instances.size();
+    if(avg_distance == 0) {
+      return INFINITY;
+    }
+    return 1.0 / avg_distance;
+  }
+  
   int size() {
     return dataset -> size();
   }
@@ -120,7 +135,8 @@ inline pair<int, double> select_medoid(int medoid, double current_avg, vector<in
   return make_pair(new_medoid, min_avg_dist);
 }
 
-inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &medoids, int epochs, double threshold) {
+
+inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &medoids, int epochs, double parent_density) {
   int n = instances.size();
   if(n <= 2) {
     medoids.insert(instances.begin(), instances.end());
@@ -133,8 +149,6 @@ inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &me
   int anchor = instances[dist(gen)];
   int sample = sample_medoid(x, instances, anchor, gen);
 
-  double anchor_dist = INFINITY;
-  double sample_dist = INFINITY;
   vector<int> anchor_inst, sample_inst;
   for(int epoch = 0; epoch < epochs; epoch++) {
     anchor_inst.clear();
@@ -161,22 +175,22 @@ inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &me
     auto new_anchor = select_medoid(anchor, avg_anchor, anchor_inst, x);
     auto new_sample = select_medoid(sample, avg_sample, sample_inst, x);
 
-    anchor_dist = new_anchor.second;
-    sample_dist = new_sample.second;
-
     if(anchor == new_anchor.first and sample == new_sample.first) break;
 
     anchor = new_anchor.first;
     sample = new_sample.first;
   }
 
-  if(anchor_dist >= threshold) {
-    kmedoids(x, anchor_inst, medoids, epochs, threshold);
+  double anchor_density = x.density(anchor, anchor_inst);
+  double sample_density = x.density(sample, sample_inst);
+    
+  if(anchor_density > parent_density) {
+    kmedoids(x, anchor_inst, medoids, epochs, anchor_density);
   } else {
     medoids.insert(anchor);
   }
-  if(sample_dist >= threshold) {
-    kmedoids(x, sample_inst, medoids, epochs, threshold);
+  if(sample_density > parent_density) {
+    kmedoids(x, sample_inst, medoids, epochs, sample_density);
   } else {
     medoids.insert(sample);
   }
