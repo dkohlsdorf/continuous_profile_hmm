@@ -126,6 +126,17 @@ Annotation:
     is skipped (logged, not fatal) -- find's own results for it still
     upload normally.
 
+Combined pvl db/csv:
+    At the end of a run (both find's own handler() and extend mode's find
+    stage -- see build_and_upload_pvl_db()), every annotated_motif_hits.csv
+    this run actually produced is pulled back down and combined via
+    sqlite_extractor.py's own clean()/context_features()/actors_features()/
+    add_path() into pvl.db + pvl_annotated_audio.csv, uploaded into this
+    run's own output folder. Best-effort: a run with no PVL configured, or
+    where every file's annotation was skipped, simply has nothing to
+    combine and uploads neither file -- logged, not fatal, find/extend's
+    own results are unaffected either way.
+
 Embeddings cache:
     Whisper-decoding a recording dominates find's runtime, and the result
     depends only on the audio -- not on any --noise-* setting -- so it's
@@ -168,16 +179,20 @@ import json
 import base64
 import binascii
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import runpod
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+
+import sqlite_extractor
 
 MOTIF_DISCOVERY_SCRIPT = "/app/motif_discovery.py"
 ANNOTATE_SCRIPT = "/app/annotate.py"
@@ -558,6 +573,83 @@ def run_annotate(output_path, pvl_path, encounter):
         print(f"  (annotation skipped: {last_line})")
     else:
         print(f"  {result.stdout.strip()}")
+
+
+ANNOTATED_CSV_NAME = "annotated_motif_hits.csv"
+PVL_DB_NAME = "pvl.db"
+PVL_CSV_NAME = "pvl_annotated_audio.csv"
+
+
+def build_and_upload_pvl_db(service, results, run_output_folder_id):
+    """
+    Best-effort, called once at the end of a find/extend job (see handler()/
+    handle_extend()): pull every ANNOTATED_CSV_NAME this job actually
+    produced (only files whose encounter matched a PVL row get one -- see
+    run_annotate()), combine them via sqlite_extractor.py's own clean()/
+    context_features()/actors_features()/add_path(), and upload the result
+    as PVL_DB_NAME + PVL_CSV_NAME into this run's own output folder. A job
+    with no PVL configured (or where every file's annotation was skipped)
+    simply has nothing to combine -- logged, not an error, since find/
+    extend's own results are unaffected either way.
+
+    add_path() only ever needs each recording's filename (never its audio
+    content) for the audio_path column, so this reconstructs that mapping
+    from each result's own already-known "name" instead of re-downloading
+    every original recording just to satisfy sqlite_extractor.py's own
+    glob-over-a-directory-of-audio-files CLI entry point.
+    """
+    candidates = [
+        (Path(r["name"]).stem, r["name"], r["output_folder_id"])
+        for r in results
+        if r.get("status") == "success" and r.get("output_folder_id")
+    ]
+    if not candidates:
+        return
+
+    workdir = tempfile.mkdtemp(prefix='motif_pvl_db_')
+    try:
+        local_paths = []
+        audio_map = {}
+        for stem, name, output_folder_id in candidates:
+            try:
+                csv_id = find_file(service, output_folder_id, ANNOTATED_CSV_NAME)
+                if not csv_id:
+                    continue
+                dest_dir = os.path.join(workdir, stem)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = os.path.join(dest_dir, ANNOTATED_CSV_NAME)
+                download_file(service, csv_id, dest)
+                local_paths.append(dest)
+                audio_map[stem] = name
+            except Exception as e:
+                print(f"  (pvl db: skipping {name}, couldn't fetch {ANNOTATED_CSV_NAME}: {e})")
+
+        if not local_paths:
+            print(f"\nNo {ANNOTATED_CSV_NAME} files produced this run -- skipping combined pvl db/csv")
+            return
+
+        print(f"\nBuilding combined pvl db/csv from {len(local_paths)} {ANNOTATED_CSV_NAME} file(s)")
+        dataframes = [sqlite_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
+        df = sqlite_extractor.clean(pd.concat(dataframes).reset_index())
+        df = sqlite_extractor.context_features(df)
+        df = sqlite_extractor.actors_features(df)
+
+        db_local = os.path.join(workdir, PVL_DB_NAME)
+        csv_local = os.path.join(workdir, PVL_CSV_NAME)
+        conn = sqlite3.connect(db_local)
+        df.to_sql("pvl", conn, if_exists="replace", index=False)
+        conn.close()
+        df.to_csv(csv_local, index=False)
+
+        print(f"Uploading {PVL_DB_NAME} and {PVL_CSV_NAME} to this run's output folder")
+        upload_file(service, run_output_folder_id, db_local, PVL_DB_NAME)
+        upload_file(service, run_output_folder_id, csv_local, PVL_CSV_NAME, mime_type='text/csv')
+    except Exception as e:
+        import traceback
+        print(f"WARNING: building/uploading combined pvl db/csv failed "
+              f"(job results are unaffected): {e}\n{traceback.format_exc()}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _as_folder_id_list(value):
@@ -1179,6 +1271,7 @@ def handle_extend(job_input):
                     results.append({"name": name, "status": "error", "error": str(err)})
 
             stages_completed.append("find")
+            build_and_upload_pvl_db(service, results, run_output_folder_id)
             return {
                 "status": "success",
                 "stage": "find",
@@ -1317,6 +1410,8 @@ def handler(job):
 
         files_processed = sum(1 for r in results if r["status"] == "success")
         files_failed = sum(1 for r in results if r["status"] == "error")
+
+        build_and_upload_pvl_db(service, results, run_output_folder_id)
 
         return {
             "status": "success",
