@@ -12,7 +12,8 @@ Two subcommands:
        candidate boundaries are already given, so every analysis window
        inside [start, stop) is kept)
     2. thin the candidate pool with DTW hierarchical k-medoid filtering
-       down to --keep-fraction of the original candidates
+       (density-driven, stops splitting a branch once its children stop
+       getting tighter -- no target count/fraction to set)
     3. run the same BIC-driven match-state / sub-model sweep used by
        processing.py to fit a profile HMM on the filtered pool
     4. decode every candidate (the full, unfiltered pool) against the
@@ -105,7 +106,6 @@ import datetime
 import json
 import math
 import os
-import random
 import time
 import wave
 import pickle as pkl
@@ -133,10 +133,9 @@ torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
 from lib_phmm.signals import load_filtered_waveform, process, classify
-from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean
+from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
-import lib_phmm.hierarchical_kmedian_dtw as hkd
 
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 
@@ -215,58 +214,97 @@ def load_candidates(csv_path, wav_path, model, processor, verbose=False, log_eve
     return candidates
 
 
-def filter_by_keep_fraction(candidates, keep_fraction, warping_band, epochs,
-                             n_samples=500, max_search_iters=15, seed=None):
+def find_non_noise_spans(classifications, min_size=10):
     """
-    hierarchical_kmedian_dtw's kmedoids() is threshold-driven, not
-    count-driven, so --keep-fraction is hit by bisecting the threshold,
-    expressed as a percentile of sampled pairwise DTW distances: a
-    higher threshold makes branches stop splitting sooner -> fewer
-    medoids kept, a lower threshold -> more medoids kept.
-
-    kmedoids' internal anchor/second-seed choice is randomized
-    (unseeded, on the C++ side), so the count-vs-threshold relationship
-    is only approximately monotonic -- this keeps the closest-to-target
-    result seen across the search rather than assuming the last
-    bisection step is the best one.
+    (start_frame, stop_frame_exclusive) for each contiguous run of
+    classifications != 'NOISE' at least min_size frames long -- same
+    segmentation lib_phmm.signals.bounded_regions() uses (verified
+    equivalent), just returning frame-index boundaries instead of sliced
+    lists, so a caller that also needs e.g. sample offsets (to slice real
+    audio for a region, not just its embeddings) doesn't have to re-derive
+    positions after the fact.
     """
-    dataset = [[[float(v) for v in frame] for frame in region_embeddings]
-               for region_embeddings, _, _ in candidates]
-    n = len(dataset)
-    target = max(1, round(n * keep_fraction))
-
-    dm = hkd.DistanceManager(dataset, warping_band)
-
-    rng = random.Random(seed)
-    max_pairs = n * (n - 1) // 2
-    n_samples = min(n_samples, max_pairs)
-    pairs = set()
-    while len(pairs) < n_samples:
-        i, j = rng.randrange(n), rng.randrange(n)
-        if i != j:
-            pairs.add((min(i, j), max(i, j)))
-    sampled_distances = sorted(dm.distance(i, j) for i, j in pairs)
-
-    lo, hi = 0.0, 100.0
-    best_ids, best_gap, trace = None, float('inf'), []
-    for _ in range(max_search_iters):
-        mid = (lo + hi) / 2
-        threshold = float(np.percentile(sampled_distances, mid))
-        medoid_ids = dm.kmedoids([], epochs, threshold)
-        gap = len(medoid_ids) - target
-        trace.append({"percentile": mid, "threshold": threshold, "n_kept": len(medoid_ids)})
-
-        if abs(gap) < abs(best_gap):
-            best_ids, best_gap = medoid_ids, gap
-        if gap == 0:
-            break
-        if len(medoid_ids) > target:
-            lo = mid   # too many kept -> raise the threshold -> more merging
+    spans = []
+    start = None
+    n = len(classifications)
+    for i, c in enumerate(classifications):
+        if c != 'NOISE':
+            if start is None:
+                start = i
         else:
-            hi = mid   # too few kept -> lower the threshold -> less merging
+            if start is not None and i - start >= min_size:
+                spans.append((start, i))
+            start = None
+    if start is not None and n - start >= min_size:
+        spans.append((start, n))
+    return spans
 
-    kept = [candidates[i] for i in best_ids]
-    return kept, trace
+
+def extract_non_noise_candidates(embeddings, classifications, min_size=10):
+    """
+    Turn one continuously-embedded file (embed_full_file()'s output) into
+    candidate tuples in the same (embeddings, embeddings, classifications)
+    shape load_candidates() produces -- one per contiguous non-NOISE run of
+    at least min_size frames (find_non_noise_spans()), the same
+    segmentation processing.py's motif mode uses (lib_phmm.signals.
+    bounded_regions()), so a region here means the same thing it does
+    there: a stretch the classifier itself thinks isn't background, with
+    no start/stop boundary given by a human.
+    """
+    spans = find_non_noise_spans(classifications, min_size=min_size)
+    return [(embeddings[start:stop], embeddings[start:stop], classifications[start:stop])
+            for start, stop in spans]
+
+
+def load_raw_resampled(wav_path, target_sample_rate):
+    """
+    Like load_waveform_at(), minus load_filtered_waveform()'s band-pass --
+    for writing region audio back out in the same raw, unfiltered shape
+    `train` expects its own CSV-bounded wav input in (train applies the
+    filter itself at load time; pre-filtering here would double-filter it
+    if this output is later fed back into train as a fresh csv_path/
+    wav_path pair).
+    """
+    waveform, sr = torchaudio.load(str(wav_path))
+    if waveform.shape[0] > 1:
+        waveform = waveform[:1]
+    if sr != target_sample_rate:
+        waveform = torchaudio.functional.resample(waveform, sr, target_sample_rate)
+    return waveform
+
+
+def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=None):
+    """
+    Embed one file via embed_full_file(), caching to output_path/
+    embeddings.pkl in the (embeddings, classifications, step_samples,
+    sample_rate) shape find_in_file() and `extend`'s candidate extraction
+    both read. Shared so a later `find`/`extend-candidates` pointed at the
+    same output_path reuses this instead of re-embedding.
+    """
+    output_path.mkdir(parents=True, exist_ok=True)
+    embeddings_path = output_path / "embeddings.pkl"
+    if embeddings_path.exists():
+        with open(embeddings_path, "rb") as f:
+            embeddings, classifications, step_samples, sample_rate = pkl.load(f)
+        print(f"Loaded cached embeddings from: {embeddings_path}")
+    else:
+        whisper_model = whisper_model_v2()
+        processor     = whisper_processor()
+        embeddings, classifications, step_samples, sample_rate = embed_full_file(
+            wav_path, whisper_model, processor, verbose=verbose,
+            target_sample_rate=target_sample_rate)
+        with open(embeddings_path, "wb") as f:
+            pkl.dump((embeddings, classifications, step_samples, sample_rate), f)
+    print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop, {sample_rate} Hz)")
+    if sample_rate != CONFIG['sampling_rate']:
+        # See find_in_file()'s identical warning -- nothing in this pipeline
+        # resamples on its own, so a rate mismatch here silently degrades
+        # whatever downstream matching/merging this embedding feeds into.
+        print(f"  WARNING: file is {sample_rate} Hz but CONFIG['sampling_rate'] is "
+              f"{CONFIG['sampling_rate']} Hz and nothing resamples -- Whisper sees this audio "
+              f"scaled by {sample_rate / CONFIG['sampling_rate']:.3g}x. Match quality is only "
+              f"meaningful if the training audio had this same rate.")
+    return embeddings, classifications, step_samples, sample_rate
 
 
 def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
@@ -274,7 +312,7 @@ def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=
     max_match caps how many sub-models sweep_one_state_count() may
     greedily add (BIC then picks how many of those to actually keep).
     Cost is roughly O(max_match * candidates^2) per n_match_states value
-    -- see sweep_one_state_count()/filter_by_keep_fraction()'s
+    -- see sweep_one_state_count()/filter_candidates_by_medoid()'s
     docstrings -- so raising it much past the default scales the whole
     sweep accordingly, not just this one knob.
 
@@ -611,6 +649,94 @@ def extract_motif_segments(path, hmm, n_states, embeddings, noise_pdf=None, clas
     return segments
 
 
+def fit_model_from_candidates(candidates, args):
+    """
+    DTW-filter + BIC-sweep discovery path shared by `train` (its "no
+    cached model" branch) and `train-candidates` (always runs this):
+    filter_candidates_by_medoid() -> sweep()/sweep_all_medoids() -> make_hmm()
+    on the winning trial.
+
+    Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
+    Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/
+    all_medoids/max_match/flank_dwell_frames/flank_alpha/require_full_match
+    off of args -- train_parser and train_candidates_parser both define
+    all of these with the same names.
+    """
+    lengths = [len(embedding) for embedding, _, _ in candidates]
+    mean_len, median_len, max_len = float(np.mean(lengths)), float(np.median(lengths)), int(np.max(lengths))
+    print(f"candidate lengths (frames): mean={mean_len:.1f} median={median_len:.1f} max={max_len}")
+
+    flank_dwell_frames = args.flank_dwell_frames if args.flank_dwell_frames is not None else mean_len
+    print(f"flank dwell target: {flank_dwell_frames:.1f} frames (flank_alpha={args.flank_alpha})")
+
+    print("==========================================")
+    print("DTW hierarchical k-medoid filtering        ")
+    print("==========================================")
+    filtered = filter_candidates_by_medoid(
+        candidates,
+        warping_band=args.dtw_warping_band,
+        epochs=args.dtw_epochs,
+        restarts=args.dtw_restarts,
+        tolerance=args.dtw_density_tolerance,
+    )
+    print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
+          f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance})")
+    n_filtered = len(filtered)
+
+    print("==========================================")
+    print("Parameter sweep HMM                        ")
+    print("==========================================")
+    if args.all_medoids:
+        print(f"all_medoids: every one of {n_filtered} filtered candidates becomes a sub-model (--max-match ignored)")
+        results = sweep_all_medoids(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+                                     require_full_match=args.require_full_match)
+    else:
+        print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
+        results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+                         require_full_match=args.require_full_match)
+    best = min(results, key=lambda r: r["bic"])
+    hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
+                              flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
+    n_models = len(hmm.pdf)
+    print(f"selected n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f}")
+
+    return hmm, n_states, n_models, best, flank_dwell_frames, n_filtered
+
+
+def score_candidates(candidates, hmm, n_states, n_models, best, n_filtered, output_path, args, dt):
+    """
+    decode_all() the full candidate pool against a fitted/loaded model and
+    write metrics.csv -- shared by `train` (both its cached-model and
+    freshly-fit branches) and `train-candidates`.
+
+    Returns (scores_norm, paths, well_fits).
+    """
+    print("==========================================")
+    print("Scoring against the full candidate pool    ")
+    print("==========================================")
+    scores_norm, paths, raw_scores = decode_all(candidates, hmm, verbose=args.verbose,
+                                                 require_full_match=args.require_full_match)
+    well_fits, well_fits_scores = best_fit(scores_norm, args.well_fit_threshold)
+    total_fit = sum(scores_norm)
+
+    msa = build_msa_from_paths(candidates, paths, n_models, n_states)
+    metrics = compute_all_metrics(msa, len(candidates))
+    metrics_df = metrics_to_dataframe(metrics)
+    metrics_df.insert(0, 'run', dt)
+    metrics_df.insert(1, 'n_candidates_total', len(candidates))
+    metrics_df.insert(2, 'n_candidates_filtered', n_filtered)
+    metrics_df.insert(3, 'n_match_states', best['n_match_states'])
+    metrics_df.insert(4, 'n_sub_models', best['n_sub_models'])
+    metrics_df.insert(5, 'bic', best['bic'])
+    metrics_df.insert(6, 'mean_fit', total_fit / len(candidates))
+    metrics_df.insert(7, 'well_fit_count', len(well_fits))
+    metrics_df.insert(8, 'well_fit_rate', len(well_fits) / len(candidates) * 100)
+    metrics_df.to_csv(output_path / "metrics.csv", index=False)
+    print(metrics_df.to_string(index=False))
+
+    return scores_norm, paths, well_fits
+
+
 def run_train(args):
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     output_path = Path(args.output_path)
@@ -652,13 +778,6 @@ def run_train(args):
         f"delete {candidates_path} and rerun"
     )
 
-    lengths = [len(embedding) for embedding, _, _ in candidates]
-    mean_len, median_len, max_len = float(np.mean(lengths)), float(np.median(lengths)), int(np.max(lengths))
-    print(f"candidate lengths (frames): mean={mean_len:.1f} median={median_len:.1f} max={max_len}")
-
-    flank_dwell_frames = args.flank_dwell_frames if args.flank_dwell_frames is not None else mean_len
-    print(f"flank dwell target: {flank_dwell_frames:.1f} frames (flank_alpha={args.flank_alpha})")
-
     if model_was_cached:
         print("==========================================")
         print("Model already exists -- loading, not recomputing")
@@ -674,68 +793,14 @@ def run_train(args):
             "bic": model_record["bic"],
         }
         n_filtered = model_record.get("n_candidates_filtered")
-        trace = None
+        flank_dwell_frames = model_record.get("flank_dwell_frames")
         print(f"Loaded model from: {model_path} "
               f"(n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f})")
     else:
-        print("==========================================")
-        print("DTW hierarchical k-medoid filtering        ")
-        print("==========================================")
-        filtered, trace = filter_by_keep_fraction(
-            candidates,
-            keep_fraction=args.keep_fraction,
-            warping_band=args.dtw_warping_band,
-            epochs=args.dtw_epochs,
-            n_samples=args.dtw_threshold_samples,
-        )
-        target = round(len(candidates) * args.keep_fraction)
-        print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
-              f"(target {args.keep_fraction:.0%} = {target})")
-        n_filtered = len(filtered)
+        hmm, n_states, n_models, best, flank_dwell_frames, n_filtered = fit_model_from_candidates(candidates, args)
 
-        print("==========================================")
-        print("Parameter sweep HMM                        ")
-        print("==========================================")
-        if args.all_medoids:
-            print(f"all_medoids: every one of {n_filtered} filtered candidates becomes a sub-model (--max-match ignored)")
-            results = sweep_all_medoids(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
-                                         require_full_match=args.require_full_match)
-        else:
-            print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
-            results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
-                             require_full_match=args.require_full_match)
-        best = min(results, key=lambda r: r["bic"])
-        hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
-                                  flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
-        n_models = len(hmm.pdf)
-        print(f"selected n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f}")
-
-    print("==========================================")
-    print("Scoring against the full candidate pool    ")
-    print("==========================================")
-    scores_norm, paths, raw_scores = decode_all(candidates, hmm, verbose=args.verbose,
-                                                 require_full_match=args.require_full_match)
-    well_fits, well_fits_scores = best_fit(scores_norm, args.well_fit_threshold)
-    total_fit = sum(scores_norm)
-
-    msa = build_msa_from_paths(candidates, paths, n_models, n_states)
-    metrics = compute_all_metrics(msa, len(candidates))
-    metrics_df = metrics_to_dataframe(metrics)
-    metrics_df.insert(0, 'run', dt)
-    metrics_df.insert(1, 'n_candidates_total', len(candidates))
-    metrics_df.insert(2, 'n_candidates_filtered', n_filtered)
-    metrics_df.insert(3, 'n_match_states', best['n_match_states'])
-    metrics_df.insert(4, 'n_sub_models', best['n_sub_models'])
-    metrics_df.insert(5, 'bic', best['bic'])
-    metrics_df.insert(6, 'mean_fit', total_fit / len(candidates))
-    metrics_df.insert(7, 'well_fit_count', len(well_fits))
-    metrics_df.insert(8, 'well_fit_rate', len(well_fits) / len(candidates) * 100)
-    metrics_df.to_csv(output_path / "metrics.csv", index=False)
-    print(metrics_df.to_string(index=False))
-
-    if trace is not None:
-        with open(output_path / "filter_trace.json", "w") as f:
-            json.dump(trace, f, indent=2)
+    scores_norm, paths, well_fits = score_candidates(candidates, hmm, n_states, n_models, best, n_filtered,
+                                                      output_path, args, dt)
 
     print("==========================================")
     print("Sub-model assignments                      ")
@@ -767,7 +832,6 @@ def run_train(args):
             "bic": best["bic"],
             "csv_path": str(args.csv_path),
             "wav_path": str(args.wav_path),
-            "keep_fraction": args.keep_fraction,
             "n_candidates_total": len(candidates),
             "n_candidates_filtered": n_filtered,
             "max_match": args.max_match,
@@ -946,31 +1010,8 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     print("==========================================")
     print("Motif search: embedding target file        ")
     print("==========================================")
-    embeddings_path = output_path / "embeddings.pkl"
-    if embeddings_path.exists():
-        with open(embeddings_path, "rb") as f:
-            embeddings, classifications, step_samples, sample_rate = pkl.load(f)
-        print(f"Loaded cached embeddings from: {embeddings_path}")
-    else:
-        whisper_model = whisper_model_v2()
-        processor     = whisper_processor()
-        embeddings, classifications, step_samples, sample_rate = embed_full_file(
-            wav_path, whisper_model, processor, verbose=verbose,
-            target_sample_rate=target_sample_rate)
-        with open(embeddings_path, "wb") as f:
-            pkl.dump((embeddings, classifications, step_samples, sample_rate), f)
-    print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop, {sample_rate} Hz)")
-    if sample_rate != CONFIG['sampling_rate']:
-        # Nothing in this pipeline resamples: process() hands raw native-rate
-        # samples to the Whisper feature extractor while telling it they're
-        # CONFIG['sampling_rate'], so the model sees the audio pitch/time
-        # -scaled by sample_rate/CONFIG['sampling_rate']. Whatever rate the
-        # model was TRAINED on is the one that has to be matched here --
-        # a mismatch silently degrades every match score.
-        print(f"  WARNING: file is {sample_rate} Hz but CONFIG['sampling_rate'] is "
-              f"{CONFIG['sampling_rate']} Hz and nothing resamples -- Whisper sees this audio "
-              f"scaled by {sample_rate / CONFIG['sampling_rate']:.3g}x. Match quality is only "
-              f"meaningful if the training audio had this same rate.")
+    embeddings, classifications, step_samples, sample_rate = embed_and_cache(
+        wav_path, output_path, verbose=verbose, target_sample_rate=target_sample_rate)
 
     print("==========================================")
     print("Motif search: decoding                     ")
@@ -1111,6 +1152,179 @@ def run_find(args):
     print("==========================================")
 
 
+def run_embed(args):
+    """
+    `embed` -- factored out of `find`'s first step: embed one file (or every
+    .wav in a directory, one output_path/<stem>/embeddings.pkl each) with no
+    model needed, so `extend-candidates` has something to extract regions
+    from before any motif model exists yet. Reuses the exact cache format
+    `find` reads, so a later `find` pointed at the same output_path skips
+    re-embedding entirely.
+    """
+    wav_path = Path(args.wav_path)
+    output_path = Path(args.output_path)
+    if wav_path.is_dir():
+        wav_files = sorted(wav_path.glob("*.wav"))
+        print(f"{args.wav_path} is a directory -- found {len(wav_files)} wav files")
+        for i, wav_file in enumerate(wav_files):
+            print("==========================================")
+            print(f"[{i + 1}/{len(wav_files)}] {wav_file.name}")
+            print("==========================================")
+            embed_and_cache(wav_file, output_path / wav_file.stem, verbose=args.verbose,
+                             target_sample_rate=args.resample_hz)
+    else:
+        embed_and_cache(wav_path, output_path, verbose=args.verbose, target_sample_rate=args.resample_hz)
+    print("==========================================")
+    print("Done")
+    print("==========================================")
+
+
+def run_extend_candidates(args):
+    """
+    `extend-candidates` -- grow a baked candidates.pkl (e.g. train's
+    L2 candidates) with new candidates mined from already-embedded files:
+    every contiguous non-NOISE run (find_non_noise_spans()) in each
+    embeddings.pkl under embeddings_dir becomes one more candidate, appended
+    to the baked pool. Written for `extend`'s "no combined candidates.pkl
+    yet" stage, but takes plain local paths -- no Drive/handler awareness.
+
+    When a file's embeddings.pkl has a sibling audio.wav (the mono audio it
+    was embedded from), the same regions are also sliced out of that audio
+    and written back out as l2_<timestamp>.csv/l2_<timestamp>.wav next to
+    output_candidates_path -- one starts,stops-into-one-wav pair in exactly
+    the format `train`'s own csv_path/wav_path input uses, so this cycle's
+    freshly-mined material stays auditable/reusable on its own, not just
+    buried as embeddings inside the merged candidates.pkl. Best-effort: a
+    file with no audio.wav next to its embeddings.pkl still contributes its
+    regions to candidates.pkl, just not to this csv/wav pair. Skipped
+    entirely if no file has one.
+    """
+    with open(args.baked_candidates_path, "rb") as f:
+        baked = pkl.load(f)
+    print(f"Loaded {len(baked)} baked candidates from {args.baked_candidates_path}")
+
+    embeddings_root = Path(args.embeddings_dir)
+    embeddings_files = sorted(embeddings_root.glob("*/embeddings.pkl"))
+    if not embeddings_files:
+        single = embeddings_root / "embeddings.pkl"
+        if single.exists():
+            embeddings_files = [single]
+    print(f"Found {len(embeddings_files)} embeddings.pkl file(s) under {embeddings_root}")
+
+    new_candidates = []
+    audio_chunks = []
+    csv_rows = []
+    cursor = 0
+    combined_sample_rate = None
+    for path in embeddings_files:
+        with open(path, "rb") as f:
+            embeddings, classifications, step_samples, sample_rate = pkl.load(f)
+        spans = find_non_noise_spans(classifications, min_size=args.min_region_frames)
+        extracted = [(embeddings[start:stop], embeddings[start:stop], classifications[start:stop])
+                     for start, stop in spans]
+        print(f"  {path.parent.name}: {len(extracted)} non-NOISE region(s) extracted from {len(embeddings)} windows")
+        new_candidates.extend(extracted)
+
+        audio_path = path.parent / "audio.wav"
+        if spans and audio_path.exists():
+            if combined_sample_rate is None:
+                combined_sample_rate = sample_rate
+            elif combined_sample_rate != sample_rate:
+                print(f"    WARNING: {path.parent.name}'s embeddings are {sample_rate} Hz but an "
+                      f"earlier file's were {combined_sample_rate} Hz -- resampling to match so "
+                      f"every region in the combined wav shares one rate")
+            waveform = load_raw_resampled(audio_path, combined_sample_rate)
+            n_samples = waveform.shape[1]
+            for start, stop in spans:
+                sample_start = min(start * step_samples, n_samples)
+                sample_stop = min(stop * step_samples, n_samples)
+                if sample_stop <= sample_start:
+                    continue
+                clip = waveform[:, sample_start:sample_stop]
+                audio_chunks.append(clip)
+                csv_rows.append((cursor, cursor + clip.shape[1]))
+                cursor += clip.shape[1]
+
+    combined = baked + new_candidates
+    print(f"Combined candidate pool: {len(baked)} baked + {len(new_candidates)} new = {len(combined)}")
+
+    output_path = Path(args.output_candidates_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        pkl.dump(combined, f)
+    print(f"Saved combined candidates to {output_path}")
+
+    if audio_chunks:
+        dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        csv_path = output_path.parent / f"l2_{dt}.csv"
+        wav_path = output_path.parent / f"l2_{dt}.wav"
+        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_path, index=False)
+        concatenated = torch.cat(audio_chunks, dim=1)
+        torchaudio.save(str(wav_path), concatenated, combined_sample_rate)
+        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_path} / {wav_path} "
+              f"(same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
+    else:
+        print("No audio.wav found next to any embeddings.pkl -- skipping l2_<timestamp>.csv/.wav output")
+
+
+def run_train_candidates(args):
+    """
+    `train-candidates` -- fit a profile HMM from an already-built
+    candidates.pkl (e.g. extend-candidates' combined pool) instead of from
+    a CSV/wav pair: same DTW-filter + BIC-sweep discovery path `train` uses
+    (fit_model_from_candidates()/score_candidates(), shared with `train`'s
+    own "no cached model" branch), minus the CSV-derived spans/
+    submodel_assignments.csv/submodel_<n>.wav export train also does --
+    there's no single source wav to slice audio from here, since candidates
+    can come from many different recordings.
+
+    --sample-rate is required (not read from a wav header, since there
+    isn't one file to read it from) and is only used to write the
+    training_metadata.json sidecar next to the model, so a later `find`
+    resamples search audio to match what these candidates were embedded at.
+    """
+    output_path = Path(args.output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    with open(args.candidates_path, "rb") as f:
+        candidates = pkl.load(f)
+    print(f"Loaded {len(candidates)} candidates from {args.candidates_path}")
+
+    model_name = args.model_name or "phmm_extended.pkl"
+    model_path = output_path / model_name
+
+    save_training_metadata(output_path, args.sample_rate, args.candidates_path)
+
+    dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    hmm, n_states, n_models, best, flank_dwell_frames, n_filtered = fit_model_from_candidates(candidates, args)
+    scores_norm, paths, well_fits = score_candidates(candidates, hmm, n_states, n_models, best, n_filtered,
+                                                      output_path, args, dt)
+
+    model_record = {
+        "hmm": hmm,
+        "n_states": n_states,
+        "n_models": n_models,
+        "n_match_states": best["n_match_states"],
+        "n_sub_models": best["n_sub_models"],
+        "bic": best["bic"],
+        "candidates_path": str(args.candidates_path),
+        "n_candidates_total": len(candidates),
+        "n_candidates_filtered": n_filtered,
+        "max_match": args.max_match,
+        "all_medoids": args.all_medoids,
+        "flank_dwell_frames": flank_dwell_frames,
+        "flank_alpha": args.flank_alpha,
+        "run": dt,
+    }
+    with open(model_path, "wb") as f:
+        pkl.dump(model_record, f)
+    print(f"Saved model to {model_path}")
+
+    print("==========================================")
+    print("Done")
+    print("==========================================")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -1120,12 +1334,12 @@ if __name__ == "__main__":
     train_parser.add_argument("wav_path", help="wav file the CSV offsets index into")
     train_parser.add_argument("output_path", help="output directory for the model pickle and statistics")
     train_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl). If it already exists, it's loaded instead of recomputing DTW filtering + the sweep.")
-    train_parser.add_argument("--keep-fraction", type=float, default=0.10, help="target fraction of candidates to keep after DTW medoid filtering")
     train_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
     train_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
     train_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
-    train_parser.add_argument("--dtw-threshold-samples", type=int, default=500, help="random candidate pairs sampled to estimate the filtering threshold")
+    train_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
+    train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
     train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
@@ -1147,8 +1361,43 @@ if __name__ == "__main__":
     find_parser.add_argument("--resample-hz", type=int, default=None, help=f"resample search and --noise-wav audio to this rate before embedding. Normally you don't pass this: the rate is read from {TRAINING_METADATA_NAME} next to the model, written by `train`, so it matches whatever that model was trained on. Nothing else in the pipeline resamples -- process() hands raw native-rate samples to the Whisper feature extractor while declaring CONFIG['sampling_rate'] -- so searching audio at a rate the model wasn't trained on silently shifts it in pitch/time and degrades every match. Use this only to override the sidecar, or for a model that predates it.")
     find_parser.add_argument("--require-full-match", action="store_true", help="disallow partial matches: by default a submodel's match-state chain can be entered or exited at any interior state (e.g. matching only the middle of a motif, skipping its start and/or end), because every match state has some trained probability of being a direct entry/exit point from B/to E. With this flag, a match must run the complete chain, true first state to true last state -- no skipping in or out. Self-transitions (dwelling on one state) are unaffected either way, since that's time-stretching an aligned position, not skipping past it. Forwards to phmm.viterbi()'s require_full_match.")
 
+    embed_parser = subparsers.add_parser("embed", help="embed a file (or directory of files) and cache the result -- find's first step, factored out so it can run with no model yet")
+    embed_parser.add_argument("wav_path", help="recording to embed, or a directory of .wav files to embed each of independently (one output_path/<wav stem>/ subfolder per file)")
+    embed_parser.add_argument("output_path", help="output directory for embeddings.pkl (same cache format/location `find` reads -- a later `find` against this output_path skips re-embedding)")
+    embed_parser.add_argument("--verbose", action="store_true", help="log progress while embedding")
+    embed_parser.add_argument("--resample-hz", type=int, default=None, help="resample audio to this rate before embedding. Pass the rate whatever candidates.pkl/model this embedding will be combined with or searched against was itself embedded at -- nothing in this pipeline resamples on its own otherwise.")
+
+    extend_candidates_parser = subparsers.add_parser("extend-candidates", help="grow a baked candidates.pkl with new candidates mined from already-embedded files' non-NOISE regions")
+    extend_candidates_parser.add_argument("baked_candidates_path", help="existing candidates.pkl to extend (e.g. train's L2 candidates.pkl)")
+    extend_candidates_parser.add_argument("embeddings_dir", help="directory containing one <stem>/embeddings.pkl per file (as written by `embed`'s directory mode), or a single embeddings.pkl directly inside it. If a <stem>/audio.wav (the mono audio that embeddings.pkl was embedded from) sits alongside it, that file's new regions are also sliced out and written to l2_<timestamp>.csv/.wav next to output_candidates_path, in the same starts,stops-into-one-wav format train's own input uses.")
+    extend_candidates_parser.add_argument("output_candidates_path", help="where to write the combined candidates.pkl (l2_<timestamp>.csv/.wav, if any audio.wav was found, are written into this same directory)")
+    extend_candidates_parser.add_argument("--min-region-frames", type=int, default=10, help="shortest contiguous non-NOISE run (in frames) to keep as a new candidate -- shorter runs are dropped as noise-classifier blips. Matches lib_phmm.signals.bounded_regions()'s own default.")
+
+    train_candidates_parser = subparsers.add_parser("train-candidates", help="fit a profile HMM directly from a candidates.pkl (e.g. extend-candidates' combined pool), no CSV/wav required")
+    train_candidates_parser.add_argument("candidates_path", help="candidates.pkl to train on")
+    train_candidates_parser.add_argument("output_path", help="output directory for the model pickle and statistics")
+    train_candidates_parser.add_argument("--sample-rate", type=int, required=True, help="the rate these candidates were embedded at -- written into training_metadata.json next to the model so a later `find` resamples search audio to match (there's no single source wav to read this from, unlike `train`)")
+    train_candidates_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_extended.pkl)")
+    train_candidates_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Ignored if --all-medoids is set.")
+    train_candidates_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally. Only n_match_states is still BIC-picked.")
+    train_candidates_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
+    train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
+    train_candidates_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
+    train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
+    train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
+    train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
+    train_candidates_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup)")
+    train_candidates_parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior")
+    train_candidates_parser.add_argument("--require-full-match", action="store_true", help="disallow partial matches everywhere this decodes -- see train's --require-full-match")
+
     args = parser.parse_args()
     if args.mode == "train":
         run_train(args)
-    else:
+    elif args.mode == "find":
         run_find(args)
+    elif args.mode == "embed":
+        run_embed(args)
+    elif args.mode == "extend-candidates":
+        run_extend_candidates(args)
+    elif args.mode == "train-candidates":
+        run_train_candidates(args)

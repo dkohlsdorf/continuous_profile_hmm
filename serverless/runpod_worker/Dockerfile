@@ -28,6 +28,16 @@ ENV OMP_NUM_THREADS=4
 ENV MKL_NUM_THREADS=4
 ENV OPENBLAS_NUM_THREADS=4
 
+# Companion fix to the thread caps above: capping thread *count* doesn't
+# stop glibc from handing each thread its own malloc arena the first time
+# it allocates, and arenas aren't reclaimed when the thread pool tears
+# down -- so RSS can still ratchet up across tens of thousands of
+# spin-up/tear-down cycles even at 4 threads each. Forcing everything
+# through one arena (the pre-glibc-2.10 default) trades a little
+# allocator contention for bounded memory here, which is the right
+# tradeoff for this single-process-per-window workload.
+ENV MALLOC_ARENA_MAX=1
+
 WORKDIR /app
 
 # build-essential/g++/gcc: compiling lib_phmm's pybind11 C++ extensions.
@@ -93,6 +103,12 @@ COPY model/wdp_whisper_emb_model_L2.pt ./model/wdp_whisper_emb_model_L2.pt
 # repo entirely -- re-copy both there to refresh.
 COPY serverless/runpod_worker/assets/phmm_l2.pkl ./motif/l2/phmm_l2.pkl
 COPY serverless/runpod_worker/assets/naive_noise.wav ./assets/naive_noise.wav
+
+# L2's candidate embeddings (motif_discovery.py train's candidates.pkl
+# cache) -- the "extend" job mode's starting pool, grown with new candidates
+# mined from a job's own recordings before retraining (see handler.py's
+# handle_extend()/motif_discovery.py's extend-candidates subcommand).
+COPY serverless/runpod_worker/assets/candidates.pkl ./motif/l2/candidates.pkl
 
 # Records the rate the model was trained at, read back by find to resample
 # both search and noise audio to match (see load_training_sample_rate() in
