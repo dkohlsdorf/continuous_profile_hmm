@@ -4,6 +4,8 @@ import os
 import glob
 import pandas as pd
 import re
+import numpy as np
+import json
 
 
 CONTEXTS = {"DIVE", "CALF", "NUZZLING", "ASCENT", "BARRACUDA", "FISH", "BITE", "BODY CHARGE", 
@@ -96,6 +98,73 @@ def actors_features(df):
         df[k] = df['shotlog::BEHdescription'].apply(lambda x: actor in str(x))    
     return df 
 
+
+def iter_windows(df, window, include_anchor=True):
+    for enc, g in df.groupby('ENC #', sort=False):
+        tc = g['tc'].to_numpy()
+        mask = (g['is_valid_string'] & (g['n_cols_set'] > 0)).to_numpy()
+        anchor_pos = np.flatnonzero(mask)
+        if len(anchor_pos) == 0:
+            continue
+        start_pos = np.searchsorted(tc, tc[anchor_pos] - window, side='left')
+        for start, end in zip(start_pos, anchor_pos):
+            yield enc, g.index[end], g.iloc[start:end + 1 if include_anchor else end]
+
+
+def features(anchor, context, ctx_index, n_clusters, n_cols):
+    y = np.zeros(n_clusters + n_cols)
+    for col, pos in ctx_index.items():
+        y[pos] = 1 if anchor[col] else 0
+    for cid in context['cluster_id'].dropna():
+        y[int(cid)] = 1
+    return y
+
+
+
+def hotcode_df(df, window=pd.Timedelta(seconds=10), keep_empty_context=False):
+    df = df.copy()
+
+    # cluster ids as numbers (handles "3" and "3.0")
+    df['cluster_id'] = pd.to_numeric(df['shotlog::BEHdescription'], errors='coerce')
+    df['is_valid_string'] = df['is_valid_string'].fillna(False).astype(bool)
+
+    ids = df.loc[~df['is_valid_string'], 'cluster_id'].dropna()
+    n_clusters = int(ids.max()) + 1 if len(ids) else 0  # ids 0..max -> max+1 slots
+
+    flag_cols = [c for c in df.columns
+                 if c.startswith(('is_', 'has_')) and c != 'is_valid_string']
+    df[flag_cols] = df[flag_cols].fillna(False).astype(bool)
+    ctx_index = {c: n_clusters + i for i, c in enumerate(flag_cols)}
+    n_cols = len(ctx_index)
+
+    df['n_cols_set'] = df[flag_cols].sum(axis=1)
+
+    s = (df['shotlog::timecode'].astype('string')
+           .str.replace(r'[^0-9:]', '', regex=True)
+           .str.rstrip(':'))
+    df['tc'] = pd.to_timedelta(s, errors='coerce')
+    df = df.sort_values(['ENC #', 'tc'], kind='stable')
+    df['tc'] = df.groupby('ENC #')['tc'].ffill()
+
+    rows, anchor_idxs = [], []
+    for enc, anchor_idx, win in iter_windows(df, window):
+        context = win.iloc[:-1]
+        context = context[~context['is_valid_string']]
+        if context.empty and not keep_empty_context:
+            continue
+        rows.append(features(win.iloc[-1], context, ctx_index, n_clusters, n_cols))
+        anchor_idxs.append(anchor_idx)
+
+    hotcoded = np.vstack(rows) if rows else np.empty((0, n_clusters + n_cols))
+    meta = {
+        'column_index': ctx_index,
+        'n_clusters': n_clusters,
+        'n_cols': n_cols,
+        'rows': [int(i) for i in anchor_idxs],
+    }
+    return hotcoded, meta
+
+
     
 if __name__ == '__main__':
     print("Insert to mysql")
@@ -116,3 +185,8 @@ if __name__ == '__main__':
         df.to_sql("pvl", conn, if_exists="replace", index=False)
         conn.close()
         df.to_csv('pvl_annotated_audio.csv', index=False)
+
+        hotcoded, hotcoding_meta = hotcode_df(df)
+        np.savetxt('hotcoded.out', hotcoded)
+        with open('hotcoding_meta.json', 'w') as f:
+            json.dump(hotcoding_meta, f)

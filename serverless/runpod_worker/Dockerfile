@@ -79,8 +79,9 @@ COPY motif_discovery.py .
 COPY annotate.py .
 # Imported directly by handler.py's build_and_upload_pvl_db() (not run as
 # its own subprocess, unlike motif_discovery.py/annotate.py) to combine a
-# run's annotated_motif_hits.csv files into pvl.db/pvl_annotated_audio.csv.
-COPY sqlite_extractor.py .
+# run's annotated_motif_hits.csv files into pvl.db/pvl_annotated_audio.csv
+# (and hotcoded.out/hotcoding_meta.json).
+COPY pvl_feature_extractor.py .
 COPY lib_phmm/ ./lib_phmm/
 
 RUN cd lib_phmm && pip install --no-cache-dir -e . --no-build-isolation && cd ..

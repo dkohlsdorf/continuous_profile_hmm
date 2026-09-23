@@ -130,12 +130,16 @@ Combined pvl db/csv:
     At the end of a run (both find's own handler() and extend mode's find
     stage -- see build_and_upload_pvl_db()), every annotated_motif_hits.csv
     this run actually produced is pulled back down and combined via
-    sqlite_extractor.py's own clean()/context_features()/actors_features()/
-    add_path() into pvl.db + pvl_annotated_audio.csv, uploaded into this
-    run's own output folder. Best-effort: a run with no PVL configured, or
-    where every file's annotation was skipped, simply has nothing to
-    combine and uploads neither file -- logged, not fatal, find/extend's
-    own results are unaffected either way.
+    pvl_feature_extractor.py's own clean()/context_features()/
+    actors_features()/add_path() into pvl.db + pvl_annotated_audio.csv,
+    plus hotcoded.out + hotcoding_meta.json from that same module's
+    hotcode_df() (a one-hot per annotated event of its own context/actor
+    flags and the motif cluster ids in the window before it -- see
+    hotcode_df()'s own docstring), all uploaded into this run's own output
+    folder. Best-effort: a run with no PVL configured, or where every
+    file's annotation was skipped, simply has nothing to combine and
+    uploads none of these files -- logged, not fatal, find/extend's own
+    results are unaffected either way.
 
 Embeddings cache:
     Whisper-decoding a recording dominates find's runtime, and the result
@@ -185,6 +189,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import runpod
 
@@ -192,7 +197,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-import sqlite_extractor
+import pvl_feature_extractor
 
 MOTIF_DISCOVERY_SCRIPT = "/app/motif_discovery.py"
 ANNOTATE_SCRIPT = "/app/annotate.py"
@@ -578,6 +583,8 @@ def run_annotate(output_path, pvl_path, encounter):
 ANNOTATED_CSV_NAME = "annotated_motif_hits.csv"
 PVL_DB_NAME = "pvl.db"
 PVL_CSV_NAME = "pvl_annotated_audio.csv"
+HOTCODED_NAME = "hotcoded.out"
+HOTCODING_META_NAME = "hotcoding_meta.json"
 
 
 def build_and_upload_pvl_db(service, results, run_output_folder_id):
@@ -585,17 +592,18 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id):
     Best-effort, called once at the end of a find/extend job (see handler()/
     handle_extend()): pull every ANNOTATED_CSV_NAME this job actually
     produced (only files whose encounter matched a PVL row get one -- see
-    run_annotate()), combine them via sqlite_extractor.py's own clean()/
-    context_features()/actors_features()/add_path(), and upload the result
-    as PVL_DB_NAME + PVL_CSV_NAME into this run's own output folder. A job
-    with no PVL configured (or where every file's annotation was skipped)
-    simply has nothing to combine -- logged, not an error, since find/
-    extend's own results are unaffected either way.
+    run_annotate()), combine them via pvl_feature_extractor.py's own
+    clean()/context_features()/actors_features()/add_path(), and upload the
+    result as PVL_DB_NAME + PVL_CSV_NAME, plus HOTCODED_NAME +
+    HOTCODING_META_NAME from that same module's hotcode_df(), into this
+    run's own output folder. A job with no PVL configured (or where every
+    file's annotation was skipped) simply has nothing to combine -- logged,
+    not an error, since find/extend's own results are unaffected either way.
 
     add_path() only ever needs each recording's filename (never its audio
     content) for the audio_path column, so this reconstructs that mapping
     from each result's own already-known "name" instead of re-downloading
-    every original recording just to satisfy sqlite_extractor.py's own
+    every original recording just to satisfy pvl_feature_extractor.py's own
     glob-over-a-directory-of-audio-files CLI entry point.
     """
     candidates = [
@@ -629,10 +637,10 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id):
             return
 
         print(f"\nBuilding combined pvl db/csv from {len(local_paths)} {ANNOTATED_CSV_NAME} file(s)")
-        dataframes = [sqlite_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
-        df = sqlite_extractor.clean(pd.concat(dataframes).reset_index())
-        df = sqlite_extractor.context_features(df)
-        df = sqlite_extractor.actors_features(df)
+        dataframes = [pvl_feature_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
+        df = pvl_feature_extractor.clean(pd.concat(dataframes).reset_index())
+        df = pvl_feature_extractor.context_features(df)
+        df = pvl_feature_extractor.actors_features(df)
 
         db_local = os.path.join(workdir, PVL_DB_NAME)
         csv_local = os.path.join(workdir, PVL_CSV_NAME)
@@ -644,6 +652,23 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id):
         print(f"Uploading {PVL_DB_NAME} and {PVL_CSV_NAME} to this run's output folder")
         upload_file(service, run_output_folder_id, db_local, PVL_DB_NAME)
         upload_file(service, run_output_folder_id, csv_local, PVL_CSV_NAME, mime_type='text/csv')
+
+        try:
+            hotcoded, hotcoding_meta = pvl_feature_extractor.hotcode_df(df)
+            hotcoded_local = os.path.join(workdir, HOTCODED_NAME)
+            hotcoding_meta_local = os.path.join(workdir, HOTCODING_META_NAME)
+            np.savetxt(hotcoded_local, hotcoded)
+            with open(hotcoding_meta_local, 'w') as f:
+                json.dump(hotcoding_meta, f)
+
+            print(f"Uploading {HOTCODED_NAME} and {HOTCODING_META_NAME} to this run's output folder")
+            upload_file(service, run_output_folder_id, hotcoded_local, HOTCODED_NAME)
+            upload_file(service, run_output_folder_id, hotcoding_meta_local, HOTCODING_META_NAME,
+                        mime_type='application/json')
+        except Exception as e:
+            import traceback
+            print(f"WARNING: building/uploading hotcoded features failed "
+                  f"(pvl db/csv upload is unaffected): {e}\n{traceback.format_exc()}")
     except Exception as e:
         import traceback
         print(f"WARNING: building/uploading combined pvl db/csv failed "
