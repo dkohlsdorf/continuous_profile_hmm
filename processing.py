@@ -24,6 +24,10 @@ if __name__ == "__main__":
     parser.add_argument("--motif-mode-filtered", action="store_true", help="like --motif-mode, but first cluster candidate regions by DTW distance (hierarchical k-medoids) and only pass the resulting medoids into the HMM sweep")
     parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance, used by --motif-mode-filtered")
     parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split, used by --motif-mode-filtered")
+    parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest, used by --motif-mode-filtered")
+    parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense), used by --motif-mode-filtered")
+    parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance: 'path' divides by warp-path length (default), 'length' by n + m, 'none' keeps the raw sum, used by --motif-mode-filtered")
+    parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across the candidate pool before DTW, used by --motif-mode-filtered")
     parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
     parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
     args = parser.parse_args()
@@ -77,8 +81,14 @@ if __name__ == "__main__":
             candidates,
             warping_band=args.dtw_warping_band,
             epochs=args.dtw_epochs,
+            restarts=args.dtw_restarts,
+            tolerance=args.dtw_density_tolerance,
+            norm=args.dtw_norm,
+            zscore=args.dtw_zscore,
         )
-        print(f"DTW medoid filter: {n_before} candidates -> {len(candidates)} medoids")
+        print(f"DTW medoid filter: {n_before} candidates -> {len(candidates)} medoids "
+              f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance}, "
+              f"norm={args.dtw_norm}, zscore={args.dtw_zscore})")
 
     print("Parameter Sweep HMM")
     results = None
