@@ -22,7 +22,7 @@ inline double euc(Vec &x, Vec &y) {
   return distance;
 }
 
-inline double dtw(Mat &x, Mat &y, int warping_band) {
+inline double dtw(Mat &x, Mat &y, int warping_band, bool normalize = true) {
   int n = x.size();
   int m = y.size();
 
@@ -52,7 +52,10 @@ inline double dtw(Mat &x, Mat &y, int warping_band) {
   }
 
   // normalize by warp-path length so distance is comparable across
-  // candidate regions of different durations
+  // candidate regions of different durations. Note the DP minimizes the
+  // summed cost, not this mean, and a longer path over cheap cells lowers
+  // the mean -- normalize=false returns the raw summed cost instead.
+  if(!normalize) return dp[n][m];
   return dp[n][m] / plen[n][m];
 }
 
@@ -62,13 +65,14 @@ inline int instance_pair_hash(int i, int j, int n_instances) {
 
 class DistanceManagement {
 public:
-  DistanceManagement(Dataset *dataset, int warping_band):dataset(dataset), warping_band(warping_band) {
+  DistanceManagement(Dataset *dataset, int warping_band, bool normalize = true)
+    :dataset(dataset), warping_band(warping_band), normalize(normalize) {
     store = Mat(dataset->size(), Vec(dataset->size(), INFINITY));
   }
 
   double distance(int i, int j) {
     if(isinf(store[i][j])) {
-      store[i][j] = dtw((*dataset)[i], (*dataset)[j], warping_band);
+      store[i][j] = dtw((*dataset)[i], (*dataset)[j], warping_band, normalize);
       store[j][i] = store[i][j];
     }
     return store[i][j];
@@ -95,6 +99,7 @@ public:
 
 private:
   int warping_band;
+  bool normalize;
   Dataset *dataset;
   Mat store;
 };

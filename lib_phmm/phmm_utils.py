@@ -198,7 +198,8 @@ def _to_dtw_dataset(candidates):
             for region_embeddings, _, _ in candidates]
 
 
-def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=10, tolerance=0.05):
+def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=10, tolerance=0.05,
+                                normalize=True):
     """
     Cluster candidate motif regions by DTW distance (divisive hierarchical
     k-medoids -- see lib_phmm/hierarchical_kmedian_dtw.hpp) and keep only
@@ -214,9 +215,14 @@ def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=
     lets a child up to that fraction less dense than its parent still
     count as an improvement (more medoids, less tight). Defaults match
     hierarchical_kmedian_dtw.hpp's own defaults.
+
+    DTW runs on the raw (uncompressed) candidate frames -- compression to
+    match states only happens afterwards, in make_hmm(), on the surviving
+    medoids -- so warping_band is in frames. normalize=False uses the raw
+    summed DTW cost instead of dividing by warp-path length.
     """
     dataset = _to_dtw_dataset(candidates)
-    dm = hkd.DistanceManager(dataset, warping_band)
+    dm = hkd.DistanceManager(dataset, warping_band, normalize)
     medoid_ids = dm.kmedoids([], epochs, restarts, tolerance)
     return [candidates[i] for i in medoid_ids]
 

@@ -676,7 +676,7 @@ def fit_model_from_candidates(candidates, args):
     on the winning trial.
 
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
-    Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/
+    Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/dtw_no_path_norm/
     all_medoids/max_match/min_match_states/flank_dwell_frames/flank_alpha/
     require_full_match off of args -- train_parser and train_candidates_parser
     both define all of these with the same names.
@@ -700,9 +700,11 @@ def fit_model_from_candidates(candidates, args):
         epochs=args.dtw_epochs,
         restarts=args.dtw_restarts,
         tolerance=args.dtw_density_tolerance,
+        normalize=not args.dtw_no_path_norm,
     )
     print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
-          f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance})")
+          f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance}, "
+          f"path_norm={not args.dtw_no_path_norm})")
     n_filtered = len(filtered)
 
     print("==========================================")
@@ -1366,6 +1368,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     train_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
     train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
+    train_parser.add_argument("--dtw-no-path-norm", action="store_true", help="use the raw summed DTW cost for medoid filtering instead of dividing it by the warp-path length (the default). Path-length normalization lets a long path over cheap cells look closer and hides duration differences between candidates")
     train_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- n_match_states is the cap on piecewise segments used to compress each candidate (see top_k_switchpoints()/make_hmm()), so raising this floor forces the sweep to only consider models rich enough to represent motifs with more turns/segments than the default floor allows. Useful with --all-medoids: count_params()'s BIC penalty scales with n_sub_models * n_match_states, so a large n_sub_models pool can make BIC floor n_match_states at the sweep's minimum regardless of true motif complexity -- raising this floor is how to override that.")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
@@ -1411,6 +1414,7 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     train_candidates_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
     train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
+    train_candidates_parser.add_argument("--dtw-no-path-norm", action="store_true", help="use the raw summed DTW cost for medoid filtering instead of dividing it by the warp-path length (the default). Path-length normalization lets a long path over cheap cells look closer and hides duration differences between candidates")
     train_candidates_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- see train's --min-match-states for why this matters especially with --all-medoids")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")

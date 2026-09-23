@@ -12,8 +12,8 @@ namespace py = pybind11;
 // it, so the pointer stays valid for the wrapper's whole lifetime.
 class DistanceManager {
 public:
-  DistanceManager(Dataset dataset, int warping_band)
-      : dataset(std::move(dataset)), impl(&this->dataset, warping_band) {}
+  DistanceManager(Dataset dataset, int warping_band, bool normalize)
+      : dataset(std::move(dataset)), impl(&this->dataset, warping_band, normalize) {}
 
   double distance(int i, int j) {
     return impl.distance(i, j);
@@ -49,14 +49,17 @@ private:
 PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
   m.doc() = "Divisive hierarchical k-medoids clustering under DTW distance";
 
-  m.def("dtw", [](Mat x, Mat y, int warping_band) { return dtw(x, y, warping_band); },
-        py::arg("x"), py::arg("y"), py::arg("warping_band"),
-        "Sakoe-Chiba banded DTW distance between two sequences.");
+  m.def("dtw", [](Mat x, Mat y, int warping_band, bool normalize) { return dtw(x, y, warping_band, normalize); },
+        py::arg("x"), py::arg("y"), py::arg("warping_band"), py::arg("normalize") = true,
+        "Sakoe-Chiba banded DTW distance between two sequences. normalize=true "
+        "divides by the warp-path length, false returns the summed cost.");
 
   py::class_<DistanceManager>(m, "DistanceManager")
-    .def(py::init<Dataset, int>(), py::arg("dataset"), py::arg("warping_band"),
+    .def(py::init<Dataset, int, bool>(), py::arg("dataset"), py::arg("warping_band"),
+         py::arg("normalize") = true,
          "dataset: list of sequences (each a list of frames/vectors). "
-         "Pairwise DTW distances are computed lazily and cached.")
+         "Pairwise DTW distances are computed lazily and cached. "
+         "normalize: divide each distance by its warp-path length (see dtw()).")
     .def("distance", &DistanceManager::distance, py::arg("i"), py::arg("j"),
          "Cached DTW distance between dataset[i] and dataset[j].")
     .def("size", &DistanceManager::size)
