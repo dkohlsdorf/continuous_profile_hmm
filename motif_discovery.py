@@ -307,7 +307,8 @@ def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=Non
     return embeddings, classifications, step_samples, sample_rate
 
 
-def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
+def sweep(candidates, max_match=MAX_MATCH, min_match_states=MIN_STATES, flank_dwell_frames=None,
+          flank_alpha=500.0, require_full_match=False):
     """
     max_match caps how many sub-models sweep_one_state_count() may
     greedily add (BIC then picks how many of those to actually keep).
@@ -315,6 +316,17 @@ def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=
     -- see sweep_one_state_count()/filter_candidates_by_medoid()'s
     docstrings -- so raising it much past the default scales the whole
     sweep accordingly, not just this one knob.
+
+    min_match_states raises the floor BIC's n_match_states sweep starts
+    from (default MIN_STATES=3). BIC's own parameter penalty
+    (count_params()) scales with n_sub_models * n_match_states, so with a
+    large n_sub_models pool (e.g. --all-medoids on a big filtered
+    candidate set) it will floor n_match_states at whatever the sweep's
+    minimum is even when the true motif shape needs more segments to
+    represent (see top_k_switchpoints()/make_hmm() -- n_match_states is
+    literally the cap on piecewise segments used to compress each
+    candidate). Raising this floor is how to force the sweep to only
+    consider state counts rich enough to capture that shape.
 
     require_full_match forwards to decode_all()/phmm.viterbi() for every
     trial decode in the sweep -- see phmm.viterbi()'s docstring. Off by
@@ -329,18 +341,25 @@ def sweep(candidates, max_match=MAX_MATCH, flank_dwell_frames=None, flank_alpha=
         delayed(sweep_one_state_count)(n_match_states, candidates, max_match, D, n_frames_total,
                                         flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
                                         require_full_match=require_full_match)
-        for n_match_states in range(MIN_STATES, MAX_STATES)
+        for n_match_states in range(min_match_states, MAX_STATES)
     )
     return [r for sublist in nested_results for r in sublist]
 
 
-def sweep_all_medoids(candidates, flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False):
+def sweep_all_medoids(candidates, min_match_states=MIN_STATES, flank_dwell_frames=None, flank_alpha=500.0,
+                       require_full_match=False):
     """
     --all-medoids counterpart to sweep(): every filtered candidate
     becomes a sub-model unconditionally (score_all_as_submodels()), so
     this is one make_hmm()+decode_all() per n_match_states value instead
     of sweep()'s O(max_match * candidates^2) greedy search per value --
     --max-match is unused here. Only n_match_states is still BIC-picked.
+
+    min_match_states: see sweep()'s docstring -- the same BIC-floors-at-
+    the-minimum effect applies here too, and is usually more pronounced,
+    since --all-medoids' whole point is a large n_sub_models pool (one
+    per filtered candidate), which is exactly what inflates
+    count_params()'s penalty against raising n_match_states at all.
 
     require_full_match: see sweep()'s docstring.
     """
@@ -350,7 +369,7 @@ def sweep_all_medoids(candidates, flank_dwell_frames=None, flank_alpha=500.0, re
         delayed(score_all_as_submodels)(n_match_states, candidates, D, n_frames_total,
                                          flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
                                          require_full_match=require_full_match)
-        for n_match_states in range(MIN_STATES, MAX_STATES)
+        for n_match_states in range(min_match_states, MAX_STATES)
     )
 
 
@@ -658,10 +677,13 @@ def fit_model_from_candidates(candidates, args):
 
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
     Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/
-    all_medoids/max_match/flank_dwell_frames/flank_alpha/require_full_match
-    off of args -- train_parser and train_candidates_parser both define
-    all of these with the same names.
+    all_medoids/max_match/min_match_states/flank_dwell_frames/flank_alpha/
+    require_full_match off of args -- train_parser and train_candidates_parser
+    both define all of these with the same names.
     """
+    if args.min_match_states >= MAX_STATES:
+        raise ValueError(f"--min-match-states ({args.min_match_states}) must be less than "
+                          f"MAX_STATES ({MAX_STATES}), or the sweep has no state counts left to try")
     lengths = [len(embedding) for embedding, _, _ in candidates]
     mean_len, median_len, max_len = float(np.mean(lengths)), float(np.median(lengths)), int(np.max(lengths))
     print(f"candidate lengths (frames): mean={mean_len:.1f} median={median_len:.1f} max={max_len}")
@@ -686,13 +708,17 @@ def fit_model_from_candidates(candidates, args):
     print("==========================================")
     print("Parameter sweep HMM                        ")
     print("==========================================")
+    print(f"n_match_states sweep floor: {args.min_match_states} (default {MIN_STATES}) -- "
+          f"BIC picks the best of [{args.min_match_states}, {MAX_STATES})")
     if args.all_medoids:
         print(f"all_medoids: every one of {n_filtered} filtered candidates becomes a sub-model (--max-match ignored)")
-        results = sweep_all_medoids(filtered, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+        results = sweep_all_medoids(filtered, min_match_states=args.min_match_states,
+                                     flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
                                      require_full_match=args.require_full_match)
     else:
         print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
-        results = sweep(filtered, max_match=args.max_match, flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+        results = sweep(filtered, max_match=args.max_match, min_match_states=args.min_match_states,
+                         flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
                          require_full_match=args.require_full_match)
     best = min(results, key=lambda r: r["bic"])
     hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
@@ -1340,6 +1366,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     train_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
     train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
+    train_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- n_match_states is the cap on piecewise segments used to compress each candidate (see top_k_switchpoints()/make_hmm()), so raising this floor forces the sweep to only consider models rich enough to represent motifs with more turns/segments than the default floor allows. Useful with --all-medoids: count_params()'s BIC penalty scales with n_sub_models * n_match_states, so a large n_sub_models pool can make BIC floor n_match_states at the sweep's minimum regardless of true motif complexity -- raising this floor is how to override that.")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
     train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
@@ -1384,6 +1411,7 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     train_candidates_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
     train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
+    train_candidates_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- see train's --min-match-states for why this matters especially with --all-medoids")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
     train_candidates_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup)")

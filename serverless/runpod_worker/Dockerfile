@@ -3,8 +3,16 @@
 # checkpoint, the trained L2 motif model, and the noise recording used for
 # --noise-wav, so a job only has to hand over Google Drive file IDs.
 #
-# Build from the repo root (continuous_profile_hmm/), not this directory:
-#   docker build -f serverless/runpod_worker/Dockerfile -t motif-find-worker .
+# Build from the repo root (continuous_profile_hmm/), not this directory.
+# RunPod pulls linux/amd64 -- on an Apple Silicon (arm64) dev machine a plain
+# `docker build` produces an arm64 image that fails to pull on RunPod with
+# "no matching manifest for linux/amd64", so always target amd64 explicitly
+# and push straight from buildx (a cross-platform image can't be `docker
+# load`-ed locally, only pushed):
+#   docker buildx build --platform linux/amd64 \
+#     -f serverless/runpod_worker/Dockerfile \
+#     -t dkohlsdorf/motif-discovery:<tag> -t dkohlsdorf/motif-discovery:latest \
+#     --push .
 
 FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
@@ -77,6 +85,11 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Linux/Python instead.
 COPY motif_discovery.py .
 COPY annotate.py .
+# Imported directly by handler.py's build_and_upload_pvl_db() (not run as
+# its own subprocess, unlike motif_discovery.py/annotate.py) to combine a
+# run's annotated_motif_hits.csv files into pvl.db/pvl_annotated_audio.csv
+# (and hotcoded.out/hotcoding_meta.json).
+COPY pvl_feature_extractor.py .
 COPY lib_phmm/ ./lib_phmm/
 
 RUN cd lib_phmm && pip install --no-cache-dir -e . --no-build-isolation && cd ..

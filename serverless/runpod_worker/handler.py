@@ -92,12 +92,23 @@ Extend mode:
                                     # tried per k-medoids level, keeping the
                                     # densest. See hierarchical_kmedian_dtw
                                     # .hpp's KMEDOIDS_RESTARTS_DEFAULT.
-        "dtw_density_tolerance": 0.05  # optional, default: train-candidates'
+        "dtw_density_tolerance": 0.05,  # optional, default: train-candidates'
                                     # own CLI default (0.05) -- how much less
                                     # dense than its parent a branch may
                                     # still be and keep splitting (higher ->
                                     # more, finer medoids). See
                                     # DENSITY_TOLERANCE_DEFAULT there.
+        "min_match_states": 3       # optional, default: train-candidates'
+                                    # own CLI default (MIN_STATES=3) -- floor
+                                    # for the BIC n_match_states sweep. With
+                                    # all_medoids=True especially, a large
+                                    # sub-model pool can make BIC floor
+                                    # n_match_states at the sweep's minimum
+                                    # regardless of true motif complexity
+                                    # (count_params()'s penalty scales with
+                                    # n_sub_models * n_match_states); raise
+                                    # this to force richer models. See
+                                    # run_train_candidates()'s docstring.
     The candidates-building stage also uploads l2_<timestamp>.csv/.wav into
     the "motif_extend_state" folder -- that cycle's newly-mined regions, in
     the same starts,stops-into-one-wav format train's own csv_path/wav_path
@@ -125,6 +136,21 @@ Annotation:
     that way, or an encounter isn't in the PVL, that one file's annotation
     is skipped (logged, not fatal) -- find's own results for it still
     upload normally.
+
+Combined pvl db/csv:
+    At the end of a run (both find's own handler() and extend mode's find
+    stage -- see build_and_upload_pvl_db()), every annotated_motif_hits.csv
+    this run actually produced is pulled back down and combined via
+    pvl_feature_extractor.py's own clean()/context_features()/
+    actors_features()/add_path() into pvl.db + pvl_annotated_audio.csv,
+    plus hotcoded.out + hotcoding_meta.json from that same module's
+    hotcode_df() (a one-hot per annotated event of its own context/actor
+    flags and the motif cluster ids in the window before it -- see
+    hotcode_df()'s own docstring), all uploaded into this run's own output
+    folder. Best-effort: a run with no PVL configured, or where every
+    file's annotation was skipped, simply has nothing to combine and
+    uploads none of these files -- logged, not fatal, find/extend's own
+    results are unaffected either way.
 
 Embeddings cache:
     Whisper-decoding a recording dominates find's runtime, and the result
@@ -168,16 +194,21 @@ import json
 import base64
 import binascii
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import runpod
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+
+import pvl_feature_extractor
 
 MOTIF_DISCOVERY_SCRIPT = "/app/motif_discovery.py"
 ANNOTATE_SCRIPT = "/app/annotate.py"
@@ -560,6 +591,103 @@ def run_annotate(output_path, pvl_path, encounter):
         print(f"  {result.stdout.strip()}")
 
 
+ANNOTATED_CSV_NAME = "annotated_motif_hits.csv"
+PVL_DB_NAME = "pvl.db"
+PVL_CSV_NAME = "pvl_annotated_audio.csv"
+HOTCODED_NAME = "hotcoded.out"
+HOTCODING_META_NAME = "hotcoding_meta.json"
+
+
+def build_and_upload_pvl_db(service, results, run_output_folder_id):
+    """
+    Best-effort, called once at the end of a find/extend job (see handler()/
+    handle_extend()): pull every ANNOTATED_CSV_NAME this job actually
+    produced (only files whose encounter matched a PVL row get one -- see
+    run_annotate()), combine them via pvl_feature_extractor.py's own
+    clean()/context_features()/actors_features()/add_path(), and upload the
+    result as PVL_DB_NAME + PVL_CSV_NAME, plus HOTCODED_NAME +
+    HOTCODING_META_NAME from that same module's hotcode_df(), into this
+    run's own output folder. A job with no PVL configured (or where every
+    file's annotation was skipped) simply has nothing to combine -- logged,
+    not an error, since find/extend's own results are unaffected either way.
+
+    add_path() only ever needs each recording's filename (never its audio
+    content) for the audio_path column, so this reconstructs that mapping
+    from each result's own already-known "name" instead of re-downloading
+    every original recording just to satisfy pvl_feature_extractor.py's own
+    glob-over-a-directory-of-audio-files CLI entry point.
+    """
+    candidates = [
+        (Path(r["name"]).stem, r["name"], r["output_folder_id"])
+        for r in results
+        if r.get("status") == "success" and r.get("output_folder_id")
+    ]
+    if not candidates:
+        return
+
+    workdir = tempfile.mkdtemp(prefix='motif_pvl_db_')
+    try:
+        local_paths = []
+        audio_map = {}
+        for stem, name, output_folder_id in candidates:
+            try:
+                csv_id = find_file(service, output_folder_id, ANNOTATED_CSV_NAME)
+                if not csv_id:
+                    continue
+                dest_dir = os.path.join(workdir, stem)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = os.path.join(dest_dir, ANNOTATED_CSV_NAME)
+                download_file(service, csv_id, dest)
+                local_paths.append(dest)
+                audio_map[stem] = name
+            except Exception as e:
+                print(f"  (pvl db: skipping {name}, couldn't fetch {ANNOTATED_CSV_NAME}: {e})")
+
+        if not local_paths:
+            print(f"\nNo {ANNOTATED_CSV_NAME} files produced this run -- skipping combined pvl db/csv")
+            return
+
+        print(f"\nBuilding combined pvl db/csv from {len(local_paths)} {ANNOTATED_CSV_NAME} file(s)")
+        dataframes = [pvl_feature_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
+        df = pvl_feature_extractor.clean(pd.concat(dataframes).reset_index())
+        df = pvl_feature_extractor.context_features(df)
+        df = pvl_feature_extractor.actors_features(df)
+
+        db_local = os.path.join(workdir, PVL_DB_NAME)
+        csv_local = os.path.join(workdir, PVL_CSV_NAME)
+        conn = sqlite3.connect(db_local)
+        df.to_sql("pvl", conn, if_exists="replace", index=False)
+        conn.close()
+        df.to_csv(csv_local, index=False)
+
+        print(f"Uploading {PVL_DB_NAME} and {PVL_CSV_NAME} to this run's output folder")
+        upload_file(service, run_output_folder_id, db_local, PVL_DB_NAME)
+        upload_file(service, run_output_folder_id, csv_local, PVL_CSV_NAME, mime_type='text/csv')
+
+        try:
+            hotcoded, hotcoding_meta = pvl_feature_extractor.hotcode_df(df)
+            hotcoded_local = os.path.join(workdir, HOTCODED_NAME)
+            hotcoding_meta_local = os.path.join(workdir, HOTCODING_META_NAME)
+            np.savetxt(hotcoded_local, hotcoded)
+            with open(hotcoding_meta_local, 'w') as f:
+                json.dump(hotcoding_meta, f)
+
+            print(f"Uploading {HOTCODED_NAME} and {HOTCODING_META_NAME} to this run's output folder")
+            upload_file(service, run_output_folder_id, hotcoded_local, HOTCODED_NAME)
+            upload_file(service, run_output_folder_id, hotcoding_meta_local, HOTCODING_META_NAME,
+                        mime_type='application/json')
+        except Exception as e:
+            import traceback
+            print(f"WARNING: building/uploading hotcoded features failed "
+                  f"(pvl db/csv upload is unaffected): {e}\n{traceback.format_exc()}")
+    except Exception as e:
+        import traceback
+        print(f"WARNING: building/uploading combined pvl db/csv failed "
+              f"(job results are unaffected): {e}\n{traceback.format_exc()}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _as_folder_id_list(value):
     """gdrive_folder_id accepts either one folder id or a list of them (extend mode only, see handle_extend())."""
     if value is None:
@@ -636,7 +764,7 @@ def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidat
 
 
 def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
-                          dtw_restarts=None, dtw_density_tolerance=None):
+                          dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -653,6 +781,15 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
     control) -- None (the default) omits the flag entirely so
     motif_discovery.py's own CLI default applies, unchanged from before
     these existed.
+
+    min_match_states forwards to train-candidates' --min-match-states (see
+    motif_discovery.py's sweep()/sweep_all_medoids() docstrings): raises the
+    floor of the BIC n_match_states sweep. Matters especially with
+    all_medoids=True, since count_params()'s BIC penalty scales with
+    n_sub_models * n_match_states -- a large all-medoids sub-model pool can
+    make BIC floor n_match_states at the sweep's minimum regardless of how
+    many segments the true motif shape actually needs. None (the default)
+    omits the flag, same as the others above.
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
@@ -667,6 +804,8 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         cmd += ['--dtw-restarts', str(dtw_restarts)]
     if dtw_density_tolerance is not None:
         cmd += ['--dtw-density-tolerance', str(dtw_density_tolerance)]
+    if min_match_states is not None:
+        cmd += ['--min-match-states', str(min_match_states)]
     _stream_subprocess(cmd, 'train-candidates')
 
 
@@ -915,9 +1054,10 @@ def handle_extend(job_input):
         output_gdrive_folder_id  -- same meaning as find's
         min_region_frames    -- default 10, see extend-candidates' own flag
         all_medoids           -- default True, see run_train_candidates()
-        dtw_restarts, dtw_density_tolerance -- optional, forwarded to
-                                 train-candidates' --dtw-restarts/
-                                 --dtw-density-tolerance (omitted, using
+        dtw_restarts, dtw_density_tolerance, min_match_states -- optional,
+                                 forwarded to train-candidates'
+                                 --dtw-restarts/--dtw-density-tolerance/
+                                 --min-match-states (omitted, using
                                  motif_discovery.py's own CLI defaults, when
                                  not given); see run_train_candidates()
         noise_components, noise_var_scale, hit_gap_seconds, require_full_match
@@ -950,6 +1090,8 @@ def handle_extend(job_input):
     dtw_restarts = int(dtw_restarts) if dtw_restarts is not None else None
     dtw_density_tolerance = job_input.get('dtw_density_tolerance')
     dtw_density_tolerance = float(dtw_density_tolerance) if dtw_density_tolerance is not None else None
+    min_match_states = job_input.get('min_match_states')
+    min_match_states = int(min_match_states) if min_match_states is not None else None
     try:
         pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
     except ValueError as e:
@@ -1094,7 +1236,8 @@ def handle_extend(job_input):
                 train_output = os.path.join(train_work_dir, 'output')
                 os.makedirs(train_output, exist_ok=True)
                 run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
-                                      dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance)
+                                      dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
+                                      min_match_states=min_match_states)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
@@ -1179,6 +1322,7 @@ def handle_extend(job_input):
                     results.append({"name": name, "status": "error", "error": str(err)})
 
             stages_completed.append("find")
+            build_and_upload_pvl_db(service, results, run_output_folder_id)
             return {
                 "status": "success",
                 "stage": "find",
@@ -1317,6 +1461,8 @@ def handler(job):
 
         files_processed = sum(1 for r in results if r["status"] == "success")
         files_failed = sum(1 for r in results if r["status"] == "error")
+
+        build_and_upload_pvl_db(service, results, run_output_folder_id)
 
         return {
             "status": "success",
