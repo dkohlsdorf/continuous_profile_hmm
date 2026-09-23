@@ -92,12 +92,23 @@ Extend mode:
                                     # tried per k-medoids level, keeping the
                                     # densest. See hierarchical_kmedian_dtw
                                     # .hpp's KMEDOIDS_RESTARTS_DEFAULT.
-        "dtw_density_tolerance": 0.05  # optional, default: train-candidates'
+        "dtw_density_tolerance": 0.05,  # optional, default: train-candidates'
                                     # own CLI default (0.05) -- how much less
                                     # dense than its parent a branch may
                                     # still be and keep splitting (higher ->
                                     # more, finer medoids). See
                                     # DENSITY_TOLERANCE_DEFAULT there.
+        "min_match_states": 3       # optional, default: train-candidates'
+                                    # own CLI default (MIN_STATES=3) -- floor
+                                    # for the BIC n_match_states sweep. With
+                                    # all_medoids=True especially, a large
+                                    # sub-model pool can make BIC floor
+                                    # n_match_states at the sweep's minimum
+                                    # regardless of true motif complexity
+                                    # (count_params()'s penalty scales with
+                                    # n_sub_models * n_match_states); raise
+                                    # this to force richer models. See
+                                    # run_train_candidates()'s docstring.
     The candidates-building stage also uploads l2_<timestamp>.csv/.wav into
     the "motif_extend_state" folder -- that cycle's newly-mined regions, in
     the same starts,stops-into-one-wav format train's own csv_path/wav_path
@@ -753,7 +764,7 @@ def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidat
 
 
 def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
-                          dtw_restarts=None, dtw_density_tolerance=None):
+                          dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -770,6 +781,15 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
     control) -- None (the default) omits the flag entirely so
     motif_discovery.py's own CLI default applies, unchanged from before
     these existed.
+
+    min_match_states forwards to train-candidates' --min-match-states (see
+    motif_discovery.py's sweep()/sweep_all_medoids() docstrings): raises the
+    floor of the BIC n_match_states sweep. Matters especially with
+    all_medoids=True, since count_params()'s BIC penalty scales with
+    n_sub_models * n_match_states -- a large all-medoids sub-model pool can
+    make BIC floor n_match_states at the sweep's minimum regardless of how
+    many segments the true motif shape actually needs. None (the default)
+    omits the flag, same as the others above.
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
@@ -784,6 +804,8 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         cmd += ['--dtw-restarts', str(dtw_restarts)]
     if dtw_density_tolerance is not None:
         cmd += ['--dtw-density-tolerance', str(dtw_density_tolerance)]
+    if min_match_states is not None:
+        cmd += ['--min-match-states', str(min_match_states)]
     _stream_subprocess(cmd, 'train-candidates')
 
 
@@ -1032,9 +1054,10 @@ def handle_extend(job_input):
         output_gdrive_folder_id  -- same meaning as find's
         min_region_frames    -- default 10, see extend-candidates' own flag
         all_medoids           -- default True, see run_train_candidates()
-        dtw_restarts, dtw_density_tolerance -- optional, forwarded to
-                                 train-candidates' --dtw-restarts/
-                                 --dtw-density-tolerance (omitted, using
+        dtw_restarts, dtw_density_tolerance, min_match_states -- optional,
+                                 forwarded to train-candidates'
+                                 --dtw-restarts/--dtw-density-tolerance/
+                                 --min-match-states (omitted, using
                                  motif_discovery.py's own CLI defaults, when
                                  not given); see run_train_candidates()
         noise_components, noise_var_scale, hit_gap_seconds, require_full_match
@@ -1067,6 +1090,8 @@ def handle_extend(job_input):
     dtw_restarts = int(dtw_restarts) if dtw_restarts is not None else None
     dtw_density_tolerance = job_input.get('dtw_density_tolerance')
     dtw_density_tolerance = float(dtw_density_tolerance) if dtw_density_tolerance is not None else None
+    min_match_states = job_input.get('min_match_states')
+    min_match_states = int(min_match_states) if min_match_states is not None else None
     try:
         pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
     except ValueError as e:
@@ -1211,7 +1236,8 @@ def handle_extend(job_input):
                 train_output = os.path.join(train_work_dir, 'output')
                 os.makedirs(train_output, exist_ok=True)
                 run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
-                                      dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance)
+                                      dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
+                                      min_match_states=min_match_states)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
