@@ -29,10 +29,19 @@ Column mapping (find -> PVL shotlog):
     submodel_id            -> shotlog::BEHdescription
     mean_llr_score          -> SPECIAL COMMENTS
     start_time_s (as H:MM:SS, zero-padded to HH:MM:SS) -> shotlog::timecode
+    stop_time_s - start_time_s                         -> duration_s
     the PVL row's own Date/ENC # (ffilled, so blank cells inherit the last
     seen value -- PVL shotlogs typically only stamp Date/ENC # on a
     sighting's first row) are copied onto every motif row for this
     encounter, then all rows (PVL + motif) are merged and time-sorted.
+
+duration_s is new (motif rows only): a PVL sighting row is a human-entered
+point-in-time annotation with no span of its own, so it gets NaN here --
+only motif rows carry a real duration, computed from find's own
+start_time_s/stop_time_s. shotlog::timecode alone was enough to place an
+event on a timeline, but not enough to know how much of the recording it
+actually covers (e.g. for clipping a tight spectrogram window around a
+hit downstream) -- duration_s is what that needs.
 """
 import argparse
 import datetime
@@ -41,7 +50,8 @@ from pathlib import Path
 
 import pandas as pd
 
-PVL_COLUMNS = ['Date', 'ENC #', 'shotlog::AC', 'shotlog::BEHdescription', 'shotlog::timecode', 'SPECIAL COMMENTS']
+PVL_SHEET_COLUMNS = ['Date', 'ENC #', 'shotlog::AC', 'shotlog::BEHdescription', 'shotlog::timecode', 'SPECIAL COMMENTS']
+PVL_COLUMNS = PVL_SHEET_COLUMNS + ['duration_s']
 
 
 def key(folder_name):
@@ -62,11 +72,12 @@ def process_pvl(pvl_path):
     by encounter.
     """
     df = pd.read_excel(pvl_path)
-    df = df[PVL_COLUMNS]
+    df = df[PVL_SHEET_COLUMNS].copy()
     filled = df.ffill()
     df['Date'] = filled['Date']
     df['ENC #'] = filled['ENC #'].astype(int)
     df['shotlog::timecode'] = df['shotlog::timecode'].apply(fix_timecode)
+    df['duration_s'] = float('nan')  # a PVL sighting is a point annotation, no span of its own
     return df
 
 
@@ -113,6 +124,7 @@ def annotate_one(output_folder, pvl_path, encounter=None):
     motifs['shotlog::timecode'] = motifs['start_time_s'].apply(
         lambda x: '0' + str(datetime.timedelta(seconds=int(x)))
     )
+    motifs['duration_s'] = motifs['stop_time_s'] - motifs['start_time_s']
     motifs = motifs[PVL_COLUMNS]
 
     annotated = pd.concat([motifs, filtered])
