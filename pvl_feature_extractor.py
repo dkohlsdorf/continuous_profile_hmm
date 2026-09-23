@@ -68,7 +68,7 @@ def clean(df):
     )
     df['is_valid_string'] = df['shotlog::BEHdescription'].apply(is_valid_string)
     df = df[['Date', 'ENC #', 'shotlog::AC', 'shotlog::BEHdescription',
-             'shotlog::timecode', 'SPECIAL COMMENTS', 'audio_path', 'is_valid_string']]
+             'shotlog::timecode', 'SPECIAL COMMENTS', 'duration_s', 'audio_path', 'is_valid_string']]
     return df
 
 
