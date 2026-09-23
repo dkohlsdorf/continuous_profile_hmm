@@ -193,13 +193,19 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12,
     return hmm, n_match_states
 
 
+def _zscore_pool(candidates, eps=1e-8):
+    frames = np.concatenate([np.asarray(region) for region, _, _ in candidates], axis=0)
+    mean, std = frames.mean(axis=0), frames.std(axis=0) + eps
+    return [((np.asarray(region) - mean) / std, full, cls) for region, full, cls in candidates]
+
+
 def _to_dtw_dataset(candidates):
     return [[[float(v) for v in frame] for frame in region_embeddings]
             for region_embeddings, _, _ in candidates]
 
 
 def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=10, tolerance=0.05,
-                                normalize=True):
+                                norm="path", zscore=False):
     """
     Cluster candidate motif regions by DTW distance (divisive hierarchical
     k-medoids -- see lib_phmm/hierarchical_kmedian_dtw.hpp) and keep only
@@ -218,11 +224,18 @@ def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=
 
     DTW runs on the raw (uncompressed) candidate frames -- compression to
     match states only happens afterwards, in make_hmm(), on the surviving
-    medoids -- so warping_band is in frames. normalize=False uses the raw
-    summed DTW cost instead of dividing by warp-path length.
+    medoids -- so warping_band is in frames. norm picks how the summed DTW
+    cost becomes a distance: "path" divides by warp-path length (default),
+    "length" by n + m (fixed per pair, so it doesn't reward longer warp
+    paths), "none" keeps the raw sum.
+
+    zscore=True standardizes each embedding dimension by its mean/std over
+    every frame in the pool before DTW, so the squared-Euclidean frame cost
+    isn't dominated by a few high-variance dimensions. Only the distances
+    change -- the returned medoids are the original, unscaled candidates.
     """
-    dataset = _to_dtw_dataset(candidates)
-    dm = hkd.DistanceManager(dataset, warping_band, normalize)
+    dataset = _to_dtw_dataset(_zscore_pool(candidates) if zscore else candidates)
+    dm = hkd.DistanceManager(dataset, warping_band, norm)
     medoid_ids = dm.kmedoids([], epochs, restarts, tolerance)
     return [candidates[i] for i in medoid_ids]
 
