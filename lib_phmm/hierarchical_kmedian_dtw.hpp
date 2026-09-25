@@ -22,7 +22,14 @@ inline double euc(Vec &x, Vec &y) {
   return distance;
 }
 
-inline double dtw(Mat &x, Mat &y, int warping_band) {
+// How dtw() turns the summed warp-path cost into a distance.
+enum DtwNorm {
+  DTW_NORM_PATH = 0,   // divide by warp-path length (per-step mean)
+  DTW_NORM_NONE = 1,   // raw summed cost
+  DTW_NORM_LENGTH = 2  // divide by n + m (fixed per pair, path-independent)
+};
+
+inline double dtw(Mat &x, Mat &y, int warping_band, int norm = DTW_NORM_PATH) {
   int n = x.size();
   int m = y.size();
 
@@ -51,8 +58,13 @@ inline double dtw(Mat &x, Mat &y, int warping_band) {
     }
   }
 
-  // normalize by warp-path length so distance is comparable across
-  // candidate regions of different durations
+  // DTW_NORM_PATH makes distances comparable across candidate regions of
+  // different durations, but the DP minimizes the summed cost, not this
+  // mean, and a longer path over cheap cells lowers the mean.
+  // DTW_NORM_LENGTH divides by n + m instead, which is fixed per pair, so
+  // the DP's optimum stays the optimum of the returned distance.
+  if(norm == DTW_NORM_NONE) return dp[n][m];
+  if(norm == DTW_NORM_LENGTH) return dp[n][m] / (n + m);
   return dp[n][m] / plen[n][m];
 }
 
@@ -62,13 +74,14 @@ inline int instance_pair_hash(int i, int j, int n_instances) {
 
 class DistanceManagement {
 public:
-  DistanceManagement(Dataset *dataset, int warping_band):dataset(dataset), warping_band(warping_band) {
+  DistanceManagement(Dataset *dataset, int warping_band, int norm = DTW_NORM_PATH)
+    :dataset(dataset), warping_band(warping_band), norm(norm) {
     store = Mat(dataset->size(), Vec(dataset->size(), INFINITY));
   }
 
   double distance(int i, int j) {
     if(isinf(store[i][j])) {
-      store[i][j] = dtw((*dataset)[i], (*dataset)[j], warping_band);
+      store[i][j] = dtw((*dataset)[i], (*dataset)[j], warping_band, norm);
       store[j][i] = store[i][j];
     }
     return store[i][j];
@@ -95,6 +108,7 @@ public:
 
 private:
   int warping_band;
+  int norm;
   Dataset *dataset;
   Mat store;
 };

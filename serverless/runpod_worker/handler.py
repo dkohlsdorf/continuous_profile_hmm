@@ -98,6 +98,13 @@ Extend mode:
                                     # still be and keep splitting (higher ->
                                     # more, finer medoids). See
                                     # DENSITY_TOLERANCE_DEFAULT there.
+        "dtw_norm": "path",         # optional, default: train-candidates'
+                                    # own CLI default ("path") -- "length"
+                                    # divides the DTW cost by n + m, "none"
+                                    # keeps the raw sum.
+        "dtw_zscore": False,        # optional, default False -- True
+                                    # z-scores each embedding dimension
+                                    # across the pool before DTW filtering.
         "min_match_states": 3       # optional, default: train-candidates'
                                     # own CLI default (MIN_STATES=3) -- floor
                                     # for the BIC n_match_states sweep. With
@@ -764,7 +771,8 @@ def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidat
 
 
 def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
-                          dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None):
+                          dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None,
+                          dtw_norm=None, dtw_zscore=False):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -806,6 +814,10 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         cmd += ['--dtw-density-tolerance', str(dtw_density_tolerance)]
     if min_match_states is not None:
         cmd += ['--min-match-states', str(min_match_states)]
+    if dtw_norm is not None:
+        cmd += ['--dtw-norm', dtw_norm]
+    if dtw_zscore:
+        cmd.append('--dtw-zscore')
     _stream_subprocess(cmd, 'train-candidates')
 
 
@@ -1092,6 +1104,8 @@ def handle_extend(job_input):
     dtw_density_tolerance = float(dtw_density_tolerance) if dtw_density_tolerance is not None else None
     min_match_states = job_input.get('min_match_states')
     min_match_states = int(min_match_states) if min_match_states is not None else None
+    dtw_norm = job_input.get('dtw_norm')
+    dtw_zscore = bool(job_input.get('dtw_zscore', False))
     try:
         pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
     except ValueError as e:
@@ -1237,7 +1251,8 @@ def handle_extend(job_input):
                 os.makedirs(train_output, exist_ok=True)
                 run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
                                       dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
-                                      min_match_states=min_match_states)
+                                      min_match_states=min_match_states, dtw_norm=dtw_norm,
+                                      dtw_zscore=dtw_zscore)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)

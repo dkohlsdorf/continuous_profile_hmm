@@ -10,10 +10,17 @@ namespace py = pybind11;
 // list could be garbage collected out from under it. This wrapper owns a
 // copy of the dataset alongside the DistanceManagement that points into
 // it, so the pointer stays valid for the wrapper's whole lifetime.
+static int parse_norm(const std::string &norm) {
+  if (norm == "path") return DTW_NORM_PATH;
+  if (norm == "none") return DTW_NORM_NONE;
+  if (norm == "length") return DTW_NORM_LENGTH;
+  throw py::value_error("norm must be 'path', 'none' or 'length', got '" + norm + "'");
+}
+
 class DistanceManager {
 public:
-  DistanceManager(Dataset dataset, int warping_band)
-      : dataset(std::move(dataset)), impl(&this->dataset, warping_band) {}
+  DistanceManager(Dataset dataset, int warping_band, const std::string &norm)
+      : dataset(std::move(dataset)), impl(&this->dataset, warping_band, parse_norm(norm)) {}
 
   double distance(int i, int j) {
     return impl.distance(i, j);
@@ -49,14 +56,20 @@ private:
 PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
   m.doc() = "Divisive hierarchical k-medoids clustering under DTW distance";
 
-  m.def("dtw", [](Mat x, Mat y, int warping_band) { return dtw(x, y, warping_band); },
-        py::arg("x"), py::arg("y"), py::arg("warping_band"),
-        "Sakoe-Chiba banded DTW distance between two sequences.");
+  m.def("dtw", [](Mat x, Mat y, int warping_band, const std::string &norm) {
+          return dtw(x, y, warping_band, parse_norm(norm));
+        },
+        py::arg("x"), py::arg("y"), py::arg("warping_band"), py::arg("norm") = "path",
+        "Sakoe-Chiba banded DTW distance between two sequences. norm: 'path' "
+        "divides the summed cost by the warp-path length, 'length' by n + m, "
+        "'none' returns the summed cost.");
 
   py::class_<DistanceManager>(m, "DistanceManager")
-    .def(py::init<Dataset, int>(), py::arg("dataset"), py::arg("warping_band"),
+    .def(py::init<Dataset, int, const std::string &>(), py::arg("dataset"), py::arg("warping_band"),
+         py::arg("norm") = "path",
          "dataset: list of sequences (each a list of frames/vectors). "
-         "Pairwise DTW distances are computed lazily and cached.")
+         "Pairwise DTW distances are computed lazily and cached. "
+         "norm: 'path', 'length' or 'none' (see dtw()).")
     .def("distance", &DistanceManager::distance, py::arg("i"), py::arg("j"),
          "Cached DTW distance between dataset[i] and dataset[j].")
     .def("size", &DistanceManager::size)
