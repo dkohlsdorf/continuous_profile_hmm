@@ -117,19 +117,21 @@ PYBIND11_MODULE(profile_hmm, m) {
     });
 
   py::class_<ProfileHMM>(m, "ProfileHMM")
-    .def(py::init<vector<vector<Gaussian>>&, FlankTransitions&>(),
-         py::arg("pdf"), py::arg("trans"))
+    .def(py::init<vector<vector<Gaussian>>&, FlankTransitions&, vector<int>&>(),
+         py::arg("pdf"), py::arg("trans"), py::arg("last_match"))
     .def_readwrite("pdf", &ProfileHMM::pdf)
     .def_readwrite("trans", &ProfileHMM::trans)
+    .def_readwrite("last_match", &ProfileHMM::last_match)
     .def(py::pickle(
       [](const ProfileHMM& hmm) {
-        return py::make_tuple(hmm.pdf, hmm.trans);
+        return py::make_tuple(hmm.pdf, hmm.trans, hmm.last_match);
       },
       [](py::tuple t) {
-        if (t.size() != 2) throw std::runtime_error("Invalid ProfileHMM pickle state");
+        if (t.size() != 3) throw std::runtime_error("Invalid ProfileHMM pickle state");
         auto pdf = t[0].cast<vector<vector<Gaussian>>>();
         auto trans = t[1].cast<FlankTransitions>();
-        return ProfileHMM(pdf, trans);
+        auto last_match = t[2].cast<vector<int>>();
+        return ProfileHMM(pdf, trans, last_match);
       }
     ))
     .def("__repr__", [](const ProfileHMM& hmm) {

@@ -178,8 +178,17 @@ private:
 
 class ProfileHMM {
 public:
-  ProfileHMM(vector<vector<Gaussian>>& pdf, FlankTransitions& trans)
-      : pdf(pdf), trans(trans) {}
+  // last_match[n]: index of sub-HMM n's last real match state. Sub-HMMs
+  // are padded to a shared state count (see make_hmm()), so for any
+  // sub-HMM shorter than the widest one this is less than pdf[n].size()-1
+  // -- viterbi()'s require_full_match exit must use it, not the padded end.
+  ProfileHMM(vector<vector<Gaussian>>& pdf, FlankTransitions& trans, vector<int>& last_match)
+      : pdf(pdf), trans(trans), last_match(last_match) {
+    assert(last_match.size() == pdf.size());
+    for (int n = 0; n < (int)pdf.size(); n++) {
+      assert(last_match[n] >= 1 && last_match[n] < (int)pdf[n].size());
+    }
+  }
 
   friend ostream& operator<<(ostream& os, const ProfileHMM& hmm) {
     os << "================================\n";
@@ -204,6 +213,7 @@ public:
 
   vector<vector<Gaussian>> pdf;
   FlankTransitions trans;
+  vector<int> last_match;
 };
 
 
@@ -243,7 +253,6 @@ inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
   int match_state_per_model = phmm.pdf[0].size();
   int n_states = match_state_per_model * n_models + MATCH_STATE;
   int length = sequence.size();
-  int last_match_index = match_state_per_model - 1;
 
   Mat W = zeros(length, n_states);
   vector<vector<Pred>> TB(length, vector<Pred>(n_states, {-1, -1}));
@@ -304,8 +313,11 @@ inline pair<double, vector<Pred>> viterbi(const Mat& sequence, ProfileHMM& phmm,
 
         // Skip-out guard: with require_full_match, only the true last
         // match state may exit to E, so a match can't end before
-        // reaching a submodel's true end.
-        bool may_exit = !require_full_match || k == last_match_index;
+        // reaching a submodel's true end. That's the submodel's own last
+        // real state, not the padded end of the chain -- padding states
+        // are never a good match, so requiring them made every submodel
+        // shorter than the widest one effectively unmatchable.
+        bool may_exit = !require_full_match || k == phmm.last_match[n];
         if (may_exit && W[i][cur] > W[i][E]) {
           W[i][E]  = W[i][cur];
           TB[i][E] = {i, cur};
