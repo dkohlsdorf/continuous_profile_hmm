@@ -151,7 +151,9 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12,
     match-state sub-HMM per input sequence -- pdf[n] is sequence n's own
     compressed Gaussians. Every sub-HMM is padded to the same
     n_match_states (the widest any sequence produced), since the C++
-    Viterbi assumes all sub-HMMs share one match-state count.
+    Viterbi assumes all sub-HMMs share one match-state count. Each
+    sub-HMM's own last real state is passed along as last_match, so
+    require_full_match exits there instead of at the padded end.
 
     flank_dwell_frames/flank_alpha are forwarded to estimate_transitions()
     -- see its docstring.
@@ -189,7 +191,8 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12,
         b_to_hmm=transition_dict['b_to_hmm'],
         mm=transition_dict['mm'],
     )
-    hmm = phmm.ProfileHMM(pdf, trans)
+    last_match = [len(mu) for mu, std, path in compressed]            # M0 sentinel shifts real states to 1..len(mu)
+    hmm = phmm.ProfileHMM(pdf, trans, last_match)
     return hmm, n_match_states
 
 

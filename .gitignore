@@ -1,3 +1,5 @@
+.virtual_documents/
+analysis_notebooks/images/
 motif
 model
 .DS_Store
