@@ -24,6 +24,18 @@ ACTORS = {"KANSAS", "SELKIE", "REMI", "AMANDA", "SPECKELD", "ONYX", "EEYORE", "N
          }
 
 
+# Per-classification thresholds on a motif row's mean_llr_score (annotate.py
+# stores it in SPECIAL COMMENTS, the classification in shotlog::AC), tuned in
+# analysis_notebooks/motif_filtering.ipynb. Motif rows below their class's
+# threshold are dropped; PVL sighting rows and unlisted classes are kept.
+LL_THRESHOLDS = {
+    'WHISTLE': 30.0,
+    'BURST':   10.0,
+    'ECHO':    10.0,
+    'NOISE':   15.0,
+}
+
+
 def find_files(roots, pattern):
     files = []
     for root in roots:
@@ -57,8 +69,37 @@ def is_valid_string(x):
     return type(x) != int and x != 'AND' and x != '' and not pd.isna(x)
 
 
-def clean(df):
-    df = df[df['shotlog::AC'] != 'NOISE'].copy()
+def resolve_ll_thresholds(overrides=None):
+    """
+    LL_THRESHOLDS with `overrides` ({classification: threshold}) merged on
+    top. A None threshold disables filtering for that classification.
+    """
+    merged = {**LL_THRESHOLDS, **(overrides or {})}
+    return {cls: float(t) for cls, t in merged.items() if t is not None}
+
+
+def filter_rows(df, ll_thresholds=None, drop_noise=True):
+    """
+    Drop motif rows whose mean_llr_score is below their classification's
+    threshold (see resolve_ll_thresholds()), and, with drop_noise, every row
+    whose sound type (shotlog::AC) is NOISE. Motif rows are the ones whose
+    shotlog::BEHdescription is a submodel id; PVL sighting rows carry no
+    score, so the threshold never applies to them.
+    """
+    thresholds = resolve_ll_thresholds(ll_thresholds)
+    is_motif = pd.to_numeric(df['shotlog::BEHdescription'], errors='coerce').notna()
+    ll = pd.to_numeric(df['SPECIAL COMMENTS'], errors='coerce')
+    threshold = df['shotlog::AC'].map(thresholds)
+    below = is_motif & threshold.notna() & ll.notna() & (ll < threshold)
+    noise = (df['shotlog::AC'] == 'NOISE') if drop_noise else pd.Series(False, index=df.index)
+    print(f"filter_rows: thresholds={thresholds} drop_noise={drop_noise} -- "
+          f"dropping {int(noise.sum())} NOISE rows, {int((below & ~noise).sum())} motif rows below threshold, "
+          f"keeping {int((~(below | noise)).sum())} of {len(df)}")
+    return df[~(below | noise)]
+
+
+def clean(df, ll_thresholds=None, drop_noise=True):
+    df = filter_rows(df, ll_thresholds, drop_noise).copy()
     df['shotlog::BEHdescription'] = df['shotlog::BEHdescription'].apply(lambda x: is_int(x))
     df['is_motif'] = df['shotlog::BEHdescription'].apply(lambda x: type(x) == int or pd.isna(x) )
     mask = df.is_motif == False 
@@ -168,16 +209,17 @@ def hotcode_df(df, window=pd.Timedelta(seconds=10), keep_empty_context=False):
     
 if __name__ == '__main__':
     print("Insert to mysql")
-    if len(sys.argv) < 2:
-        print("Usage: python sqlite_converter.py PATH_TO_ANNOTATIONS PATH")
+    if len(sys.argv) < 3:
+        print("Usage: python pvl_feature_extractor.py PATH_TO_ANNOTATIONS AUDIO_PATH ['{\"WHISTLE\": 25}']")
     else:
         print(f"Processing: {sys.argv[1]}")
         root  = [sys.argv[1]]
         audio = [sys.argv[2]]
+        ll_thresholds = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
         files = find_files(root, 'annotated_motif_hits.csv')
         audio = audio_map(find_files(audio, '*.m4a') + find_files(audio, '*.wav')) 
         dataframes = [add_path(pd.read_csv(f), f, audio) for f in files]
-        df = clean(pd.concat(dataframes).reset_index())
+        df = clean(pd.concat(dataframes).reset_index(), ll_thresholds)
         df = context_features(df)
         df = actors_features(df)
         
