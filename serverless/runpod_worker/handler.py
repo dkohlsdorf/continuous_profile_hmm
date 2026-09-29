@@ -44,6 +44,11 @@ Input:
             "pvl_file_id": "..."        # optional, default none -- a Drive file id for a PVL .xlsx
                                         # shotlog (see Annotation below). Downloaded once per job; if
                                         # omitted, annotation is simply skipped, find is unaffected.
+            "ll_thresholds": {"WHISTLE": 25}  # optional -- per-classification mean_llr_score
+                                        # thresholds for the combined pvl db/csv, merged over
+                                        # pvl_feature_extractor.LL_THRESHOLDS (null disables a
+                                        # class). Motif rows below threshold and NOISE rows
+                                        # are dropped. Also applies in extend mode.
         }
     }
 
@@ -605,7 +610,7 @@ HOTCODED_NAME = "hotcoded.out"
 HOTCODING_META_NAME = "hotcoding_meta.json"
 
 
-def build_and_upload_pvl_db(service, results, run_output_folder_id):
+def build_and_upload_pvl_db(service, results, run_output_folder_id, ll_thresholds=None):
     """
     Best-effort, called once at the end of a find/extend job (see handler()/
     handle_extend()): pull every ANNOTATED_CSV_NAME this job actually
@@ -617,6 +622,9 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id):
     run's own output folder. A job with no PVL configured (or where every
     file's annotation was skipped) simply has nothing to combine -- logged,
     not an error, since find/extend's own results are unaffected either way.
+
+    ll_thresholds overrides pvl_feature_extractor.LL_THRESHOLDS per
+    classification (see filter_rows() there).
 
     add_path() only ever needs each recording's filename (never its audio
     content) for the audio_path column, so this reconstructs that mapping
@@ -656,7 +664,7 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id):
 
         print(f"\nBuilding combined pvl db/csv from {len(local_paths)} {ANNOTATED_CSV_NAME} file(s)")
         dataframes = [pvl_feature_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
-        df = pvl_feature_extractor.clean(pd.concat(dataframes).reset_index())
+        df = pvl_feature_extractor.clean(pd.concat(dataframes).reset_index(), ll_thresholds)
         df = pvl_feature_extractor.context_features(df)
         df = pvl_feature_extractor.actors_features(df)
 
@@ -693,6 +701,17 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id):
               f"(job results are unaffected): {e}\n{traceback.format_exc()}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _parse_ll_thresholds(value):
+    """ll_thresholds job input: a {classification: number or null} map, or absent."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+            isinstance(k, str) and (v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)))
+            for k, v in value.items()):
+        raise ValueError("ll_thresholds must be a map of classification -> number (or null to disable)")
+    return value
 
 
 def _as_folder_id_list(value):
@@ -1107,6 +1126,10 @@ def handle_extend(job_input):
     dtw_norm = job_input.get('dtw_norm')
     dtw_zscore = bool(job_input.get('dtw_zscore', False))
     try:
+        ll_thresholds = _parse_ll_thresholds(job_input.get('ll_thresholds'))
+    except ValueError as e:
+        return {"error": str(e)}
+    try:
         pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
     except ValueError as e:
         return {"error": str(e)}
@@ -1337,7 +1360,7 @@ def handle_extend(job_input):
                     results.append({"name": name, "status": "error", "error": str(err)})
 
             stages_completed.append("find")
-            build_and_upload_pvl_db(service, results, run_output_folder_id)
+            build_and_upload_pvl_db(service, results, run_output_folder_id, ll_thresholds)
             return {
                 "status": "success",
                 "stage": "find",
@@ -1399,6 +1422,10 @@ def handler(job):
     # process_one_file()/run_annotate()); if not, annotation is simply
     # skipped -- find itself is unaffected either way.
     pvl_file_id = job_input.get('pvl_file_id')
+    try:
+        ll_thresholds = _parse_ll_thresholds(job_input.get('ll_thresholds'))
+    except ValueError as e:
+        return {"error": str(e)}
 
     if not gdrive_folder_id:
         return {"error": "gdrive_folder_id is required"}
@@ -1477,7 +1504,7 @@ def handler(job):
         files_processed = sum(1 for r in results if r["status"] == "success")
         files_failed = sum(1 for r in results if r["status"] == "error")
 
-        build_and_upload_pvl_db(service, results, run_output_folder_id)
+        build_and_upload_pvl_db(service, results, run_output_folder_id, ll_thresholds)
 
         return {
             "status": "success",
