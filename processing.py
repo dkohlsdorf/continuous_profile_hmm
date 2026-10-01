@@ -28,9 +28,14 @@ if __name__ == "__main__":
     parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense), used by --motif-mode-filtered")
     parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance: 'path' divides by warp-path length (default), 'length' by n + m, 'none' keeps the raw sum, used by --motif-mode-filtered")
     parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across the candidate pool before DTW, used by --motif-mode-filtered")
+    parser.add_argument("--variance", choices=VARIANCE_MODES, default="medoid", help="how sub-model emissions are estimated (see make_hmm()): 'medoid' (default) from each medoid alone; 'shared'/'cluster' also use the other members of each medoid's DTW cluster and need --motif-mode-filtered (see motif_discovery.py's --variance)")
+    parser.add_argument("--max-members", type=int, default=5, help="--variance cluster only: at most this many cluster members per sub-model, nearest to the medoid first")
+    parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state towards its medoid's mean and the shared variance")
     parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
     parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
     args = parser.parse_args()
+    if args.variance != 'medoid' and not args.motif_mode_filtered:
+        parser.error(f"--variance {args.variance} needs --motif-mode-filtered (it builds sub-models from DTW clusters)")
 
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     path = args.path
@@ -45,7 +50,8 @@ if __name__ == "__main__":
     print("==========================================")
 
     embeddings_path = f'{output_path}/embeddings.pkl'
-    results_path    = f'{output_path}/results.pkl'
+    # sweep results depend on the variance mode, so pooled modes get their own cache
+    results_path    = f'{output_path}/results.pkl' if args.variance == 'medoid' else f'{output_path}/results_{args.variance}.pkl'
 
     files = [f'{path}/{file}' for file in os.listdir(path) if file.endswith('.wav')]
 
@@ -75,8 +81,10 @@ if __name__ == "__main__":
         for region_classifications, region_embeddings in sequence:
             candidates.append((region_embeddings, full_embedding, region_classifications))
 
+    construction = {}
     if args.motif_mode_filtered:
         n_before = len(candidates)
+        pooled = args.variance != 'medoid'
         candidates = filter_candidates_by_medoid(
             candidates,
             warping_band=args.dtw_warping_band,
@@ -85,7 +93,12 @@ if __name__ == "__main__":
             tolerance=args.dtw_density_tolerance,
             norm=args.dtw_norm,
             zscore=args.dtw_zscore,
+            return_members=pooled,
         )
+        if pooled:
+            candidates, members = candidates
+            construction = dict(members=members, variance=args.variance,
+                                max_members=args.max_members, shrinkage=args.shrinkage)
         print(f"DTW medoid filter: {n_before} candidates -> {len(candidates)} medoids "
               f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance}, "
               f"norm={args.dtw_norm}, zscore={args.dtw_zscore})")
@@ -101,7 +114,7 @@ if __name__ == "__main__":
         D = embeddings[0][1].shape[1]
         n_frames_total = sum(len(embedding) for _, embedding, _ in embeddings)
         nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
-            delayed(sweep_one_state_count)(n_match_states, candidates, MAX_MATCH, D, n_frames_total)
+            delayed(sweep_one_state_count)(n_match_states, candidates, MAX_MATCH, D, n_frames_total, **construction)
             for n_match_states in range(MIN_STATES, MAX_STATES)
         )
         results = [r for sublist in nested_results for r in sublist]
@@ -109,7 +122,10 @@ if __name__ == "__main__":
             pkl.dump(results, f)
 
     best = min(results, key=lambda r: r["bic"])
-    hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"])
+    # exemplar_members comes from the same sweep, so a cached results file carries its own clusters
+    hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
+                              members=best.get("exemplar_members"), variance=args.variance,
+                              max_members=args.max_members, shrinkage=args.shrinkage)
     scores_norm, paths, raw_scores = decode_all(embeddings, hmm)
     well_fits, well_fits_scores = best_fit(scores_norm, 34)
     total_fit = sum(scores_norm)
