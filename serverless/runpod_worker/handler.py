@@ -49,6 +49,12 @@ Input:
                                         # pvl_feature_extractor.LL_THRESHOLDS (null disables a
                                         # class). Motif rows below threshold and NOISE rows
                                         # are dropped. Also applies in extend mode.
+            "gap_dwell_frames": 10000,  # optional, default: find's own (100). Expected background
+                                        # gap between hits in frames; log2(1/gap_dwell_frames) is
+                                        # charged once per hit, so raising it merges fragmented
+                                        # hits (100 -> 6.6 bits, 1e4 -> 13.3, 1e6 -> 19.9 per hit).
+                                        # See find's --gap-dwell-frames. Also applies in extend mode.
+            "repeat_prob": 0.999        # optional, default: find's own (0.999) -- see --repeat-prob.
         }
     }
 
@@ -281,7 +287,7 @@ NOISE_EMBEDDINGS_CACHE_PATH = "/app/work/noise_embeddings.pkl"
 # shape, or if the packaged noise wav / its target sample rate changes --
 # a bump makes the old Drive entry simply invisible rather than silently
 # reused.
-NOISE_EMBEDDINGS_CACHE_VERSION = "v1"
+NOISE_EMBEDDINGS_CACHE_VERSION = "v2"  # v2: new packaged naive_noise.wav (k-means++ noise sample)
 NOISE_EMBEDDINGS_CACHE_NAME = f"noise_embeddings.{NOISE_EMBEDDINGS_CACHE_VERSION}.pkl"
 
 
@@ -535,7 +541,7 @@ def convert_to_mono_first_channel(input_path, output_path):
 
 
 def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
-             require_full_match=False, model_path=MODEL_PATH):
+             require_full_match=False, model_path=MODEL_PATH, gap_dwell_frames=None, repeat_prob=None):
     """
     Run motif_discovery.py find for one wav file against a model + the
     packaged noise recording, streaming its output live. cwd=APP_DIR because
@@ -549,6 +555,9 @@ def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_s
     and phmm.viterbi()'s docstring) -- disallows partial matches (entering
     or exiting a submodel's match-state chain at an interior state). Off
     by default, matching find's own default.
+
+    gap_dwell_frames/repeat_prob forward to find's --gap-dwell-frames/
+    --repeat-prob when given (None keeps find's own defaults).
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'find',
@@ -562,6 +571,10 @@ def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_s
     ]
     if require_full_match:
         cmd.append('--require-full-match')
+    if gap_dwell_frames is not None:
+        cmd += ['--gap-dwell-frames', str(gap_dwell_frames)]
+    if repeat_prob is not None:
+        cmd += ['--repeat-prob', str(repeat_prob)]
     process = subprocess.Popen(
         cmd, cwd=APP_DIR,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -701,6 +714,21 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id, ll_threshold
               f"(job results are unaffected): {e}\n{traceback.format_exc()}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _parse_search_transitions(job_input):
+    """gap_dwell_frames (> 1) and repeat_prob (in (0, 1)) job inputs, each None when absent."""
+    gap_dwell_frames = job_input.get('gap_dwell_frames')
+    repeat_prob = job_input.get('repeat_prob')
+    if gap_dwell_frames is not None:
+        gap_dwell_frames = float(gap_dwell_frames)
+        if not gap_dwell_frames > 1:
+            raise ValueError("gap_dwell_frames must be > 1 (expected J dwell in frames)")
+    if repeat_prob is not None:
+        repeat_prob = float(repeat_prob)
+        if not 0 < repeat_prob < 1:
+            raise ValueError("repeat_prob must be strictly between 0 and 1")
+    return gap_dwell_frames, repeat_prob
 
 
 def _parse_ll_thresholds(value):
@@ -924,7 +952,7 @@ def save_noise_embeddings(output_path, service=None, embeddings_cache_folder_id=
 
 def process_one_file(service, file_info, run_output_folder_id, noise_components, noise_var_scale,
                       hit_gap_seconds, embeddings_cache_folder_id=None, require_full_match=False,
-                      pvl_path=None):
+                      pvl_path=None, gap_dwell_frames=None, repeat_prob=None):
     """
     Download -> convert to mono -> find -> annotate -> upload -> delete
     local files, for a single Drive file. Returns a result dict; never
@@ -985,7 +1013,8 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
 
         print(f"  Running find: {name}")
         run_find(mono_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
-                 require_full_match=require_full_match)
+                 require_full_match=require_full_match, gap_dwell_frames=gap_dwell_frames,
+                 repeat_prob=repeat_prob)
 
         save_noise_embeddings(output_path, service, embeddings_cache_folder_id)
 
@@ -1127,7 +1156,8 @@ def handle_extend(job_input):
     dtw_zscore = bool(job_input.get('dtw_zscore', False))
     try:
         ll_thresholds = _parse_ll_thresholds(job_input.get('ll_thresholds'))
-    except ValueError as e:
+        gap_dwell_frames, repeat_prob = _parse_search_transitions(job_input)
+    except (TypeError, ValueError) as e:
         return {"error": str(e)}
     try:
         pvl_ids_by_folder = _as_pvl_id_list(job_input.get('pvl_file_id'), len(gdrive_folder_ids))
@@ -1335,7 +1365,8 @@ def handle_extend(job_input):
 
                     print(f"  Running find: {name}")
                     run_find(e["mono_path"], e["output_path"], noise_components, noise_var_scale,
-                             hit_gap_seconds, require_full_match=require_full_match, model_path=model_local)
+                             hit_gap_seconds, require_full_match=require_full_match, model_path=model_local,
+                             gap_dwell_frames=gap_dwell_frames, repeat_prob=repeat_prob)
 
                     save_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
 
@@ -1424,7 +1455,8 @@ def handler(job):
     pvl_file_id = job_input.get('pvl_file_id')
     try:
         ll_thresholds = _parse_ll_thresholds(job_input.get('ll_thresholds'))
-    except ValueError as e:
+        gap_dwell_frames, repeat_prob = _parse_search_transitions(job_input)
+    except (TypeError, ValueError) as e:
         return {"error": str(e)}
 
     if not gdrive_folder_id:
@@ -1440,7 +1472,8 @@ def handler(job):
     print(f"Input Google Drive folder: {gdrive_folder_id}")
     print(f"Output Google Drive folder: {output_gdrive_folder_id or '(same as input)'}")
     print(f"noise_components={noise_components} noise_var_scale={noise_var_scale} "
-          f"hit_gap_seconds={hit_gap_seconds} require_full_match={require_full_match}")
+          f"hit_gap_seconds={hit_gap_seconds} require_full_match={require_full_match} "
+          f"gap_dwell_frames={gap_dwell_frames} repeat_prob={repeat_prob}")
 
     try:
         print("\nInitializing Google Drive connection...")
@@ -1496,6 +1529,8 @@ def handler(job):
                     embeddings_cache_folder_id=cache_folder_id,
                     require_full_match=require_full_match,
                     pvl_path=pvl_path,
+                    gap_dwell_frames=gap_dwell_frames,
+                    repeat_prob=repeat_prob,
                 ))
         finally:
             if pvl_work_dir:
