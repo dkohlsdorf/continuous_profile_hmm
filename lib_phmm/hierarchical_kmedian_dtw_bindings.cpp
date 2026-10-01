@@ -47,6 +47,21 @@ public:
     return std::vector<int>(medoids.begin(), medoids.end());
   }
 
+  // Same clustering as kmedoids(), but returns {medoid: leaf members}
+  // (medoid included). Instances a splitting branch used as its anchor/
+  // sample are not passed down to either child, so they appear in no leaf.
+  std::map<int, std::vector<int>> kmedoids_leaves(std::vector<int> instances, int epochs, int restarts,
+                                                  double tolerance) {
+    if (instances.empty()) {
+      instances.resize(impl.size());
+      for (int i = 0; i < impl.size(); i++) instances[i] = i;
+    }
+    std::set<int> medoids;
+    std::map<int, std::vector<int>> leaves;
+    ::kmedoids(impl, instances, medoids, epochs, 0.0, restarts, tolerance, &leaves);
+    return leaves;
+  }
+
 private:
   Dataset dataset;
   DistanceManagement impl;
@@ -85,5 +100,12 @@ PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
          "kept; `tolerance` is the fractional slack allowed below the "
          "parent's density before a branch stops (0.05 = a child up to 5% "
          "less dense than its parent still keeps splitting). Returns the "
-         "resulting leaf medoids as dataset indices.");
+         "resulting leaf medoids as dataset indices.")
+    .def("kmedoids_leaves", &DistanceManager::kmedoids_leaves,
+         py::arg("instances") = std::vector<int>{}, py::arg("epochs") = 20,
+         py::arg("restarts") = KMEDOIDS_RESTARTS_DEFAULT, py::arg("tolerance") = DENSITY_TOLERANCE_DEFAULT,
+         "Same clustering as kmedoids(), but returns {medoid: leaf members} "
+         "(dataset indices, medoid included). Instances a splitting branch "
+         "used as its anchor/sample are passed to neither child and appear "
+         "in no leaf.");
 }
