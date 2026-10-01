@@ -133,7 +133,7 @@ torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
 from lib_phmm.signals import load_filtered_waveform, process, classify
-from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid
+from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid, VARIANCE_MODES
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
 
@@ -308,7 +308,7 @@ def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=Non
 
 
 def sweep(candidates, max_match=MAX_MATCH, min_match_states=MIN_STATES, flank_dwell_frames=None,
-          flank_alpha=500.0, require_full_match=False):
+          flank_alpha=500.0, require_full_match=False, construction=None):
     """
     max_match caps how many sub-models sweep_one_state_count() may
     greedily add (BIC then picks how many of those to actually keep).
@@ -334,20 +334,23 @@ def sweep(candidates, max_match=MAX_MATCH, min_match_states=MIN_STATES, flank_dw
     selection itself is scored the way the model will actually be
     decoded, instead of picking a state count/sub-model set under lenient
     partial-match scoring and then deploying it under a stricter rule.
+
+    construction: optional make_hmm() emission settings (members, variance,
+    max_members, shrinkage), forwarded to every trial model.
     """
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
     nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
         delayed(sweep_one_state_count)(n_match_states, candidates, max_match, D, n_frames_total,
                                         flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
-                                        require_full_match=require_full_match)
+                                        require_full_match=require_full_match, **(construction or {}))
         for n_match_states in range(min_match_states, MAX_STATES)
     )
     return [r for sublist in nested_results for r in sublist]
 
 
 def sweep_all_medoids(candidates, min_match_states=MIN_STATES, flank_dwell_frames=None, flank_alpha=500.0,
-                       require_full_match=False):
+                       require_full_match=False, construction=None):
     """
     --all-medoids counterpart to sweep(): every filtered candidate
     becomes a sub-model unconditionally (score_all_as_submodels()), so
@@ -361,14 +364,14 @@ def sweep_all_medoids(candidates, min_match_states=MIN_STATES, flank_dwell_frame
     per filtered candidate), which is exactly what inflates
     count_params()'s penalty against raising n_match_states at all.
 
-    require_full_match: see sweep()'s docstring.
+    require_full_match, construction: see sweep()'s docstring.
     """
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
     return Parallel(n_jobs=-1, backend="loky", verbose=10)(
         delayed(score_all_as_submodels)(n_match_states, candidates, D, n_frames_total,
                                          flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
-                                         require_full_match=require_full_match)
+                                         require_full_match=require_full_match, **(construction or {}))
         for n_match_states in range(min_match_states, MAX_STATES)
     )
 
@@ -678,8 +681,12 @@ def fit_model_from_candidates(candidates, args):
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
     Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/dtw_norm/dtw_zscore/
     all_medoids/max_match/min_match_states/flank_dwell_frames/flank_alpha/
-    require_full_match off of args -- train_parser and train_candidates_parser
-    both define all of these with the same names.
+    require_full_match/variance/max_members/shrinkage off of args --
+    train_parser and train_candidates_parser both define all of these with
+    the same names.
+
+    variance != 'medoid' also keeps each medoid's leaf cluster and builds
+    the sub-models from all of its members (see make_hmm()).
     """
     if args.min_match_states >= MAX_STATES:
         raise ValueError(f"--min-match-states ({args.min_match_states}) must be less than "
@@ -694,6 +701,7 @@ def fit_model_from_candidates(candidates, args):
     print("==========================================")
     print("DTW hierarchical k-medoid filtering        ")
     print("==========================================")
+    pooled = args.variance != 'medoid'
     filtered = filter_candidates_by_medoid(
         candidates,
         warping_band=args.dtw_warping_band,
@@ -702,7 +710,17 @@ def fit_model_from_candidates(candidates, args):
         tolerance=args.dtw_density_tolerance,
         norm=args.dtw_norm,
         zscore=args.dtw_zscore,
+        return_members=pooled,
     )
+    construction = None
+    if pooled:
+        filtered, members = filtered
+        sizes = np.array([1 + len(m) for m in members])
+        construction = dict(members=members, variance=args.variance,
+                            max_members=args.max_members, shrinkage=args.shrinkage)
+        print(f"sub-model construction: variance={args.variance} from all cluster members "
+              f"(cluster size median {np.median(sizes):.0f}, max {sizes.max()}; "
+              f"max_members={args.max_members}, shrinkage={args.shrinkage})")
     print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
           f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance}, "
           f"norm={args.dtw_norm}, zscore={args.dtw_zscore})")
@@ -717,15 +735,17 @@ def fit_model_from_candidates(candidates, args):
         print(f"all_medoids: every one of {n_filtered} filtered candidates becomes a sub-model (--max-match ignored)")
         results = sweep_all_medoids(filtered, min_match_states=args.min_match_states,
                                      flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
-                                     require_full_match=args.require_full_match)
+                                     require_full_match=args.require_full_match, construction=construction)
     else:
         print(f"max_match={args.max_match} (cost scales ~O(max_match * candidates^2) per n_match_states value)")
         results = sweep(filtered, max_match=args.max_match, min_match_states=args.min_match_states,
                          flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
-                         require_full_match=args.require_full_match)
+                         require_full_match=args.require_full_match, construction=construction)
     best = min(results, key=lambda r: r["bic"])
     hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
-                              flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha)
+                              flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
+                              members=best["exemplar_members"], variance=args.variance,
+                              max_members=args.max_members, shrinkage=args.shrinkage)
     n_models = len(hmm.pdf)
     print(f"selected n_match_states={best['n_match_states']}, n_sub_models={best['n_sub_models']}, BIC={best['bic']:.1f}")
 
@@ -865,6 +885,7 @@ def run_train(args):
             "n_candidates_filtered": n_filtered,
             "max_match": args.max_match,
             "all_medoids": args.all_medoids,
+            "variance": args.variance,
             "flank_dwell_frames": flank_dwell_frames,
             "flank_alpha": args.flank_alpha,
             "run": dt,
@@ -1341,6 +1362,7 @@ def run_train_candidates(args):
         "n_candidates_filtered": n_filtered,
         "max_match": args.max_match,
         "all_medoids": args.all_medoids,
+        "variance": args.variance,
         "flank_dwell_frames": flank_dwell_frames,
         "flank_alpha": args.flank_alpha,
         "run": dt,
@@ -1365,6 +1387,9 @@ if __name__ == "__main__":
     train_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_<wav stem>.pkl). If it already exists, it's loaded instead of recomputing DTW filtering + the sweep.")
     train_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
     train_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
+    train_parser.add_argument("--variance", choices=VARIANCE_MODES, default="medoid", help="how sub-model emissions are estimated (see make_hmm()): 'medoid' (default) from each DTW-filter medoid alone; 'shared' keeps the medoid's states and means but gives every state of every sub-model one diagonal variance pooled from all leaf-cluster members aligned to their medoid; 'cluster' estimates each state's mean and variance from its medoid plus its --max-members nearest cluster members, shrunk towards the medoid mean / shared variance by --shrinkage pseudo-frames. Both pooled modes also pool the members' alignments into each sub-model's dwell/entry transitions.")
+    train_parser.add_argument("--max-members", type=int, default=5, help="--variance cluster only: at most this many cluster members (nearest to the medoid by DTW first) per sub-model, so large clusters can't pull in other clusters' examples (default 5: on a held-out test this kept misassignments to the largest clusters at the medoid model's rate while raising own-cluster decoding; 20 gains more but roughly doubles that pull)")
+    train_parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state's mean towards its medoid's and its variance towards the shared variance, so states with few member frames stay close to the medoid (default 10)")
     train_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     train_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")
@@ -1412,6 +1437,9 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--model-name", default=None, help="filename for the saved model pickle, written under output_path (default: phmm_extended.pkl)")
     train_candidates_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Ignored if --all-medoids is set.")
     train_candidates_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally. Only n_match_states is still BIC-picked.")
+    train_candidates_parser.add_argument("--variance", choices=VARIANCE_MODES, default="medoid", help="how sub-model emissions are estimated (see make_hmm()): 'medoid' (default) from each DTW-filter medoid alone; 'shared' keeps the medoid's states and means but gives every state of every sub-model one diagonal variance pooled from all leaf-cluster members aligned to their medoid; 'cluster' estimates each state's mean and variance from its medoid plus its --max-members nearest cluster members, shrunk towards the medoid mean / shared variance by --shrinkage pseudo-frames. Both pooled modes also pool the members' alignments into each sub-model's dwell/entry transitions.")
+    train_candidates_parser.add_argument("--max-members", type=int, default=5, help="--variance cluster only: at most this many cluster members (nearest to the medoid by DTW first) per sub-model, so large clusters can't pull in other clusters' examples (default 5: on a held-out test this kept misassignments to the largest clusters at the medoid model's rate while raising own-cluster decoding; 20 gains more but roughly doubles that pull)")
+    train_candidates_parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state's mean towards its medoid's and its variance towards the shared variance, so states with few member frames stay close to the medoid (default 10)")
     train_candidates_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
     train_candidates_parser.add_argument("--dtw-restarts", type=int, default=10, help="random (anchor, sample) restarts tried per k-medoids split, keeping the densest -- more restarts cost more but rarely hurt quality, since a single random split only has roughly a coin-flip's chance of beating its parent's density on real DTW distances")

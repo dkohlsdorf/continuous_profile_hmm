@@ -127,6 +127,24 @@ Extend mode:
                                     # n_sub_models * n_match_states); raise
                                     # this to force richer models. See
                                     # run_train_candidates()'s docstring.
+        "submodel_construction": "medoid",  # optional, default "medoid" --
+                                    # how each sub-model's emissions (and
+                                    # dwell/entry transitions) are estimated
+                                    # from its DTW leaf cluster:
+                                    #   "medoid": the medoid alone (as before)
+                                    #   "all_exemplar_shared_variance": medoid
+                                    #     states/means, one variance shared
+                                    #     by all states, pooled from every
+                                    #     cluster member
+                                    #   "all_exemplar_construction": means and
+                                    #     variances from the medoid plus its
+                                    #     nearest cluster members
+                                    # Both all_exemplar modes pool all
+                                    # members' alignments into the
+                                    # transitions. Only used when a model is
+                                    # trained -- delete phmm_extended.pkl in
+                                    # motif_extend_state to retrain. See
+                                    # train-candidates' --variance.
     The candidates-building stage also uploads l2_<timestamp>.csv/.wav into
     the "motif_extend_state" folder -- that cycle's newly-mined regions, in
     the same starts,stops-into-one-wav format train's own csv_path/wav_path
@@ -817,9 +835,17 @@ def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidat
     ], 'extend-candidates')
 
 
+# submodel_construction job input -> train-candidates' --variance
+SUBMODEL_CONSTRUCTION_MODES = {
+    "medoid": "medoid",
+    "all_exemplar_shared_variance": "shared",
+    "all_exemplar_construction": "cluster",
+}
+
+
 def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
                           dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None,
-                          dtw_norm=None, dtw_zscore=False):
+                          dtw_norm=None, dtw_zscore=False, variance='medoid'):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -845,6 +871,9 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
     make BIC floor n_match_states at the sweep's minimum regardless of how
     many segments the true motif shape actually needs. None (the default)
     omits the flag, same as the others above.
+
+    variance forwards to train-candidates' --variance ('medoid', 'shared'
+    or 'cluster', see SUBMODEL_CONSTRUCTION_MODES); 'medoid' omits the flag.
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
@@ -865,6 +894,8 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         cmd += ['--dtw-norm', dtw_norm]
     if dtw_zscore:
         cmd.append('--dtw-zscore')
+    if variance != 'medoid':
+        cmd += ['--variance', variance]
     _stream_subprocess(cmd, 'train-candidates')
 
 
@@ -1120,6 +1151,8 @@ def handle_extend(job_input):
                                  --min-match-states (omitted, using
                                  motif_discovery.py's own CLI defaults, when
                                  not given); see run_train_candidates()
+        submodel_construction -- default "medoid"; see SUBMODEL_CONSTRUCTION_MODES
+                                 and the module docstring
         noise_components, noise_var_scale, hit_gap_seconds, require_full_match
                               -- same meaning as find's, used only at the find stage
         pvl_file_id           -- one id shared by every folder, or a list matched
@@ -1154,6 +1187,11 @@ def handle_extend(job_input):
     min_match_states = int(min_match_states) if min_match_states is not None else None
     dtw_norm = job_input.get('dtw_norm')
     dtw_zscore = bool(job_input.get('dtw_zscore', False))
+    submodel_construction = job_input.get('submodel_construction', 'medoid')
+    if submodel_construction not in SUBMODEL_CONSTRUCTION_MODES:
+        return {"error": f"submodel_construction must be one of {sorted(SUBMODEL_CONSTRUCTION_MODES)}, "
+                         f"got {submodel_construction!r}"}
+    variance = SUBMODEL_CONSTRUCTION_MODES[submodel_construction]
     try:
         ll_thresholds = _parse_ll_thresholds(job_input.get('ll_thresholds'))
         gap_dwell_frames, repeat_prob = _parse_search_transitions(job_input)
@@ -1305,7 +1343,7 @@ def handle_extend(job_input):
                 run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
                                       dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
                                       min_match_states=min_match_states, dtw_norm=dtw_norm,
-                                      dtw_zscore=dtw_zscore)
+                                      dtw_zscore=dtw_zscore, variance=variance)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
