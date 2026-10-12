@@ -271,6 +271,12 @@ EXTEND_STATE_FOLDER_NAME = "motif_extend_state"
 EXTEND_CANDIDATES_NAME = "candidates.pkl"
 EXTEND_MODEL_NAME = "phmm_extended.pkl"
 EXTEND_TRAINING_METADATA_NAME = "training_metadata.json"
+# Same names motif_discovery.py writes them under (CANDIDATE_SOURCES_NAME /
+# CANDIDATE_MEDOIDS_NAME there), plus the per-recording summary built from
+# both after training -- see candidate_stats().
+EXTEND_CANDIDATE_SOURCES_NAME = "candidate_sources.csv"
+EXTEND_CANDIDATE_MEDOIDS_NAME = "candidate_medoids.csv"
+EXTEND_CANDIDATE_STATS_NAME = "candidate_stats.csv"
 
 # motif_hits.csv + submodel_<n>_hits.wav are this run's deliverables.
 # embeddings.pkl and noise_embeddings.pkl both go to the persistent Drive
@@ -832,6 +838,31 @@ def _log_dedupe(kept, dropped):
               f"(kept {k.get('_source_folder_id') or ''}/{k['name']})")
 
 
+def candidate_stats(sources, medoids):
+    """
+    Per source recording: how many non-NOISE regions extend-candidates found
+    in it (n_found), how many were long enough (min_region_frames) to join
+    the candidate pool training ran on (n_used_for_training), and how many
+    of those the DTW filter kept as medoids (n_medoids). sources/medoids are
+    candidate_sources.csv/candidate_medoids.csv. The baked pool shows up as
+    one "baked" row. encounter/year come from the stem's leading MMDDYYNN
+    code (e.g. "08162401_..." -> 8162401, 2024); blank when the stem doesn't
+    start with one.
+    """
+    df = sources.assign(found=sources["start_frame"].notna() | sources["candidate_index"].notna(),
+                        medoid=sources["candidate_index"].isin(medoids["candidate_index"]))
+    stats = df.groupby("stem").agg(
+        n_found=("found", "sum"),
+        n_used_for_training=("candidate_index", "count"),
+        n_medoids=("medoid", "sum"),
+    ).reset_index()
+    code = stats["stem"].str.split("_").str[0]
+    valid = code.str.match(r"^\d{8}$")
+    stats.insert(0, "encounter", pd.to_numeric(code.str[1:].where(valid)).astype("Int64"))
+    stats.insert(2, "year", (2000 + pd.to_numeric(code.str[4:6].where(valid))).astype("Int64"))
+    return stats
+
+
 def _as_pvl_id_list(value, n):
     """
     pvl_file_id (extend mode only) accepts: omitted (no PVL for any
@@ -1388,6 +1419,8 @@ def handle_extend(job_input):
 
                 print(f"Uploading combined candidates to extend state folder: {EXTEND_CANDIDATES_NAME}")
                 upload_file(service, state_folder_id, combined_local, EXTEND_CANDIDATES_NAME)
+                upload_file(service, state_folder_id, os.path.join(embroot, EXTEND_CANDIDATE_SOURCES_NAME),
+                            EXTEND_CANDIDATE_SOURCES_NAME, mime_type='text/csv')
 
                 # This cycle's freshly-mined regions, in the same
                 # starts,stops-into-one-wav format train's own csv_path/
@@ -1432,6 +1465,21 @@ def handle_extend(job_input):
                 metrics_local = os.path.join(train_output, 'metrics.csv')
                 if os.path.exists(metrics_local):
                     upload_file(service, state_folder_id, metrics_local, 'metrics.csv')
+
+                medoids_local = os.path.join(train_output, EXTEND_CANDIDATE_MEDOIDS_NAME)
+                upload_file(service, state_folder_id, medoids_local, EXTEND_CANDIDATE_MEDOIDS_NAME,
+                            mime_type='text/csv')
+                sources_id = find_file(service, state_folder_id, EXTEND_CANDIDATE_SOURCES_NAME)
+                if sources_id:
+                    sources_local = os.path.join(train_work_dir, EXTEND_CANDIDATE_SOURCES_NAME)
+                    download_file(service, sources_id, sources_local)
+                    stats_local = os.path.join(train_work_dir, EXTEND_CANDIDATE_STATS_NAME)
+                    candidate_stats(pd.read_csv(sources_local), pd.read_csv(medoids_local)).to_csv(stats_local, index=False)
+                    print(f"Uploading per-recording candidate stats to extend state folder: {EXTEND_CANDIDATE_STATS_NAME}")
+                    upload_file(service, state_folder_id, stats_local, EXTEND_CANDIDATE_STATS_NAME, mime_type='text/csv')
+                else:
+                    print(f"No {EXTEND_CANDIDATE_SOURCES_NAME} in extend state folder (candidates built before it "
+                          f"existed) -- skipping {EXTEND_CANDIDATE_STATS_NAME}")
             finally:
                 shutil.rmtree(train_work_dir, ignore_errors=True)
 

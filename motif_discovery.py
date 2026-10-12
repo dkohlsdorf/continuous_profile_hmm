@@ -449,6 +449,12 @@ def write_submodel_audio(wav_path, spans, submodel_ids, n_models, output_path, s
 
 
 TRAINING_METADATA_NAME = "training_metadata.json"
+# Written next to extend-candidates' output / train-candidates' model:
+# Every non-NOISE region extend-candidates found, with its candidate index
+# when long enough to join the pool ("baked" stem for the baked pool), and
+# the candidate indices train-candidates' DTW filter kept as medoids.
+CANDIDATE_SOURCES_NAME = "candidate_sources.csv"
+CANDIDATE_MEDOIDS_NAME = "candidate_medoids.csv"
 
 
 def training_metadata_path(model_path):
@@ -711,16 +717,20 @@ def fit_model_from_candidates(candidates, args):
         norm=args.dtw_norm,
         zscore=args.dtw_zscore,
         return_members=pooled,
+        return_ids=True,
     )
     construction = None
+    medoid_ids = filtered[-1]
     if pooled:
-        filtered, members = filtered
+        filtered, members = filtered[0], filtered[1]
         sizes = np.array([1 + len(m) for m in members])
         construction = dict(members=members, variance=args.variance,
                             max_members=args.max_members, shrinkage=args.shrinkage)
         print(f"sub-model construction: variance={args.variance} from all cluster members "
               f"(cluster size median {np.median(sizes):.0f}, max {sizes.max()}; "
               f"max_members={args.max_members}, shrinkage={args.shrinkage})")
+    else:
+        filtered = filtered[0]
     print(f"DTW medoid filter: {len(candidates)} candidates -> {len(filtered)} medoids "
           f"(restarts={args.dtw_restarts}, tolerance={args.dtw_density_tolerance}, "
           f"norm={args.dtw_norm}, zscore={args.dtw_zscore})")
@@ -742,6 +752,7 @@ def fit_model_from_candidates(candidates, args):
                          flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
                          require_full_match=args.require_full_match, construction=construction)
     best = min(results, key=lambda r: r["bic"])
+    best["medoid_ids"] = medoid_ids  # for train-candidates' candidate_medoids.csv
     hmm, n_states = make_hmm(best["exemplar_embeddings"], best["exemplar_classifications"], best["n_match_states"],
                               flank_dwell_frames=flank_dwell_frames, flank_alpha=args.flank_alpha,
                               members=best["exemplar_members"], variance=args.variance,
@@ -1262,6 +1273,10 @@ def run_extend_candidates(args):
     print(f"Found {len(embeddings_files)} embeddings.pkl file(s) under {embeddings_root}")
 
     new_candidates = []
+    # One row per non-NOISE region found; candidate_index (into the combined
+    # pool) only for those long enough to become a candidate. A file with no
+    # region at all still gets one empty row so it shows up with 0s.
+    sources = [(i, "baked", None, None) for i in range(len(baked))]
     audio_chunks = []
     csv_rows = []
     cursor = 0
@@ -1274,6 +1289,11 @@ def run_extend_candidates(args):
                      for start, stop in spans]
         print(f"  {path.parent.name}: {len(extracted)} non-NOISE region(s) extracted from {len(embeddings)} windows")
         new_candidates.extend(extracted)
+        used = {span: len(baked) + len(new_candidates) - len(extracted) + k for k, span in enumerate(spans)}
+        found = find_non_noise_spans(classifications, min_size=1)
+        sources.extend((used.get(span), path.parent.name, *span) for span in found)
+        if not found:
+            sources.append((None, path.parent.name, None, None))
 
         audio_path = path.parent / "audio.wav"
         if spans and audio_path.exists():
@@ -1303,6 +1323,11 @@ def run_extend_candidates(args):
     with open(output_path, "wb") as f:
         pkl.dump(combined, f)
     print(f"Saved combined candidates to {output_path}")
+    sources_path = output_path.parent / CANDIDATE_SOURCES_NAME
+    pd.DataFrame(sources, columns=["candidate_index", "stem", "start_frame", "stop_frame"]) \
+        .astype({"candidate_index": "Int64", "start_frame": "Int64", "stop_frame": "Int64"}) \
+        .to_csv(sources_path, index=False)
+    print(f"Saved per-candidate source recording to {sources_path}")
 
     if audio_chunks:
         dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1370,6 +1395,9 @@ def run_train_candidates(args):
     with open(model_path, "wb") as f:
         pkl.dump(model_record, f)
     print(f"Saved model to {model_path}")
+
+    pd.DataFrame({"candidate_index": best["medoid_ids"]}).to_csv(output_path / CANDIDATE_MEDOIDS_NAME, index=False)
+    print(f"Saved the DTW medoids' candidate indices to {output_path / CANDIDATE_MEDOIDS_NAME}")
 
     print("==========================================")
     print("Done")

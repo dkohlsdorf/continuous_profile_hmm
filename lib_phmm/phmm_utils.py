@@ -341,7 +341,7 @@ def _to_dtw_dataset(candidates):
 
 
 def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=10, tolerance=0.05,
-                                norm="path", zscore=False, return_members=False):
+                                norm="path", zscore=False, return_members=False, return_ids=False):
     """
     Cluster candidate motif regions by DTW distance (divisive hierarchical
     k-medoids -- see lib_phmm/hierarchical_kmedian_dtw.hpp) and keep only
@@ -375,12 +375,15 @@ def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=
     make_hmm()'s pooled variance modes estimate from. Candidates the tree
     used as a split anchor/sample end up in no leaf (see kmedoids_leaves());
     each of those joins its nearest medoid's cluster.
+
+    return_ids=True also returns the medoids' indices into candidates, last.
     """
     dataset = _to_dtw_dataset(_zscore_pool(candidates) if zscore else candidates)
     dm = hkd.DistanceManager(dataset, warping_band, norm)
     if not return_members:
         medoid_ids = dm.kmedoids([], epochs, restarts, tolerance)
-        return [candidates[i] for i in medoid_ids]
+        medoids = [candidates[i] for i in medoid_ids]
+        return (medoids, list(medoid_ids)) if return_ids else medoids
 
     leaves = dm.kmedoids_leaves([], epochs, restarts, tolerance)
     medoid_ids = sorted(leaves)
@@ -391,7 +394,8 @@ def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=
             clusters[min(medoid_ids, key=lambda m: dm.distance(i, m))].append(i)
     members = [[candidates[i] for i in sorted(clusters[m], key=lambda i: dm.distance(i, m))]
                for m in medoid_ids]
-    return [candidates[m] for m in medoid_ids], members
+    medoids = [candidates[m] for m in medoid_ids]
+    return (medoids, members, medoid_ids) if return_ids else (medoids, members)
 
 
 def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total,
