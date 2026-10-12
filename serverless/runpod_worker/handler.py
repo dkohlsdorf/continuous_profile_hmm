@@ -399,13 +399,20 @@ def list_audio_files(service, folder_id):
         f"mimeType='audio/mp4' or mimeType='audio/x-m4a' or mimeType='audio/m4a' or "
         f"{name_clauses}) and trashed=false"
     )
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType)",
-        pageSize=1000,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
+    files, page_token = [], None
+    while True:
+        results = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        files.extend(results.get('files', []))
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
 
     # The Drive query's "name contains '<ext>'" clauses can match a
     # Google-native file (Doc/Sheet/Slides/etc.) whose name merely contains
@@ -413,7 +420,7 @@ def list_audio_files(service, folder_id):
     # download (only export), so exclude any Google Workspace mimeType and
     # require the name to actually end in one of AUDIO_EXTENSIONS.
     return [
-        f for f in results.get('files', [])
+        f for f in files
         if not f.get('mimeType', '').startswith('application/vnd.google-apps')
         and f['name'].lower().endswith(AUDIO_EXTENSIONS)
     ]
