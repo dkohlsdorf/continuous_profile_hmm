@@ -623,7 +623,7 @@ def encounter_from_filename(stem):
     return int(stem.split('_')[0][1:])
 
 
-def run_annotate(output_path, pvl_path, encounter):
+def run_annotate(output_path, pvl_path, encounter, file_id=None):
     """
     Best-effort: merge this recording's motif_hits.csv into the matching
     rows of the job's PVL spreadsheet via annotate.py, writing
@@ -632,8 +632,12 @@ def run_annotate(output_path, pvl_path, encounter):
     Never raises: an encounter that isn't in this PVL, or any other
     annotate.py failure, must not fail a file that find already succeeded
     on -- it just means no annotated_motif_hits.csv gets uploaded for it.
+    file_id (the recording's Drive file id) lands in every row's
+    audio_file_id, so the audio can be fetched straight from pvl.db.
     """
     cmd = ['python', '-u', ANNOTATE_SCRIPT, output_path, pvl_path, '--encounter', str(encounter)]
+    if file_id:
+        cmd += ['--file-id', file_id]
     result = subprocess.run(cmd, cwd=APP_DIR, capture_output=True, text=True)
     if result.returncode != 0:
         last_line = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
@@ -647,6 +651,28 @@ PVL_DB_NAME = "pvl.db"
 PVL_CSV_NAME = "pvl_annotated_audio.csv"
 HOTCODED_NAME = "hotcoded.out"
 HOTCODING_META_NAME = "hotcoding_meta.json"
+
+
+def first_file_pvl_rows(dataframes):
+    """
+    Concatenate per-recording annotated_motif_hits.csv frames, keeping each
+    encounter's PVL sighting rows from its first recording only.
+    annotate.py copies an encounter's whole PVL into every recording of it,
+    so an encounter with several recordings (e.g. E1234_a/E1234_b) would
+    otherwise list every sighting once per recording. Motif rows (the ones
+    whose shotlog::BEHdescription is a submodel id, as in
+    pvl_feature_extractor.filter_rows()) are all kept -- each is a real
+    detection in its own file, told apart by audio_path/audio_file_id.
+    """
+    tagged = [d.assign(_file_rank=i) for i, d in enumerate(dataframes)]
+    df = pd.concat(tagged, ignore_index=True)
+    is_motif = pd.to_numeric(df['shotlog::BEHdescription'], errors='coerce').notna()
+    first_rank = df['_file_rank'].where(~is_motif).groupby(df['ENC #']).transform('min')
+    keep = is_motif | (df['_file_rank'] == first_rank)
+    dropped = int((~keep).sum())
+    if dropped:
+        print(f"pvl db: dropped {dropped} PVL row(s) repeated across recordings of the same encounter")
+    return df[keep].drop(columns='_file_rank')
 
 
 def build_and_upload_pvl_db(service, results, run_output_folder_id, ll_thresholds=None):
@@ -703,7 +729,7 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id, ll_threshold
 
         print(f"\nBuilding combined pvl db/csv from {len(local_paths)} {ANNOTATED_CSV_NAME} file(s)")
         dataframes = [pvl_feature_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
-        df = pvl_feature_extractor.clean(pd.concat(dataframes).reset_index(), ll_thresholds)
+        df = pvl_feature_extractor.clean(first_file_pvl_rows(dataframes).reset_index(), ll_thresholds)
         df = pvl_feature_extractor.context_features(df)
         df = pvl_feature_extractor.actors_features(df)
 
@@ -775,6 +801,50 @@ def _as_folder_id_list(value):
     if isinstance(value, str):
         return [value]
     return list(value)
+
+
+def dedupe_by_stem(files, has_pvl=None):
+    """
+    Keep one file per recording stem. Every per-recording artifact (the
+    embeddings cache entry, the find output folder, pvl_feature_extractor's
+    audio_map) is keyed by stem, so two files sharing one -- the same
+    recording in overlapping folders, or a .wav next to an .m4a -- would
+    otherwise silently mix one file's cached embeddings with the other's
+    audio.
+
+    files must be in priority order (folder order first). Within one folder
+    the Drive listing order isn't guaranteed, so ties there go to the
+    alphabetically first name, keeping the choice stable across the
+    separate submissions of an extend job family. has_pvl(file) -> bool,
+    when given, lets a copy whose folder has a PVL win over an earlier one
+    whose folder doesn't, so dedupe never costs a recording its annotation.
+    Returns (kept, dropped) -- both lists of file dicts, kept in input order.
+    """
+    folder_rank = {}
+    for f in files:
+        folder_rank.setdefault(f.get('_source_folder_id'), len(folder_rank))
+    ordered = sorted(files, key=lambda f: (folder_rank[f.get('_source_folder_id')], f['name']))
+
+    kept = {}
+    for f in ordered:
+        stem = Path(f['name']).stem
+        current = kept.get(stem)
+        if current is None or (has_pvl and not has_pvl(current) and has_pvl(f)):
+            kept[stem] = f
+    kept_ids = {id(f) for f in kept.values()}
+    return ([f for f in ordered if id(f) in kept_ids],
+            [f for f in ordered if id(f) not in kept_ids])
+
+
+def _log_dedupe(kept, dropped):
+    if not dropped:
+        return
+    kept_by_stem = {Path(f['name']).stem: f for f in kept}
+    print(f"Dedupe by stem: kept {len(kept)} recording(s), dropped {len(dropped)} same-stem duplicate(s):")
+    for f in dropped:
+        k = kept_by_stem[Path(f['name']).stem]
+        print(f"  dropped {f.get('_source_folder_id') or ''}/{f['name']} "
+              f"(kept {k.get('_source_folder_id') or ''}/{k['name']})")
 
 
 def _as_pvl_id_list(value, n):
@@ -1066,7 +1136,7 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
                 print(f"  (annotation skipped: couldn't read an encounter number from '{name}' "
                       f"-- expected \"E<number>_...\": {e})")
             else:
-                run_annotate(output_path, pvl_path, encounter)
+                run_annotate(output_path, pvl_path, encounter, file_id=file_info['id'])
 
         embeddings_uploaded = False
         if embeddings_cache_folder_id and not embeddings_cached and os.path.exists(embeddings_path):
@@ -1235,6 +1305,8 @@ def handle_extend(job_input):
     if not files:
         return {"error": "No WAV/M4A files found in the specified Google Drive folder(s)"}
     print(f"Found {len(files)} audio files total across {len(gdrive_folder_ids)} folder(s)")
+    files, dropped = dedupe_by_stem(files, has_pvl=lambda f: bool(folder_to_pvl_id.get(f['_source_folder_id'])))
+    _log_dedupe(files, dropped)
 
     state_folder_id = find_or_create_folder(service, parent_folder_for_output, EXTEND_STATE_FOLDER_NAME)
     embeddings_cache_folder_id = find_or_create_folder(service, parent_folder_for_output, EMBEDDINGS_CACHE_FOLDER_NAME)
@@ -1443,7 +1515,7 @@ def handle_extend(job_input):
                             print(f"  (annotation skipped: couldn't read an encounter number from '{name}' "
                                   f"-- expected \"E<number>_...\": {err})")
                         else:
-                            run_annotate(e["output_path"], pvl_path, encounter)
+                            run_annotate(e["output_path"], pvl_path, encounter, file_id=e["file_info"]["id"])
                     file_output_folder_id = create_output_folder(service, run_output_folder_id, stem)
                     uploaded = upload_folder_contents(service, file_output_folder_id, e["output_path"],
                                                        skip_names=UPLOAD_SKIP_NAMES)
@@ -1548,6 +1620,8 @@ def handler(job):
         if not files:
             return {"error": "No WAV/M4A files found in the specified Google Drive folder"}
         print(f"Found {len(files)} audio files")
+        files, dropped = dedupe_by_stem(files)
+        _log_dedupe(files, dropped)
 
         parent_folder_for_output = output_gdrive_folder_id or gdrive_folder_id
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
