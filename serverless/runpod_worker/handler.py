@@ -85,6 +85,14 @@ Extend mode:
                                     # stage; a length mismatch against
                                     # gdrive_folder_id is a hard error, not
                                     # a silent misalignment.
+        "find_pvl_only": false,     # optional, default false -- true runs
+                                    # the find stage only on files from
+                                    # folders with a pvl_file_id. Candidate
+                                    # mining/training still use every
+                                    # folder, and once candidates.pkl exists
+                                    # the non-PVL folders aren't even
+                                    # downloaded/embedded. Needs at least
+                                    # one non-null pvl_file_id.
         "min_region_frames": 10,    # optional, default 10 -- shortest
                                     # contiguous non-NOISE run (in frames)
                                     # to keep as a new training candidate
@@ -1159,6 +1167,9 @@ def handle_extend(job_input):
                                  positionally to gdrive_folder_id (null for a
                                  folder with no PVL); see _as_pvl_id_list(). Also
                                  only matters at the find stage.
+        find_pvl_only         -- default False; True restricts the find stage
+                                 (and, once candidates exist, embedding) to
+                                 folders with a pvl_file_id
 
     Returns a dict with "stage": "find" (this always finishes there now)
     and a "stages_completed" list saying which of candidates_built /
@@ -1202,6 +1213,9 @@ def handle_extend(job_input):
     except ValueError as e:
         return {"error": str(e)}
     folder_to_pvl_id = dict(zip(gdrive_folder_ids, pvl_ids_by_folder))
+    find_pvl_only = bool(job_input.get('find_pvl_only', False))
+    if find_pvl_only and not any(pvl_ids_by_folder):
+        return {"error": "find_pvl_only is set but no folder has a pvl_file_id"}
 
     service = get_drive_service()
     # output_gdrive_folder_id, or the first input folder if not given -- same
@@ -1231,6 +1245,13 @@ def handle_extend(job_input):
     candidates_id = find_file(service, state_folder_id, EXTEND_CANDIDATES_NAME)
     model_id = find_file(service, state_folder_id, EXTEND_MODEL_NAME) if candidates_id else None
     stages_completed = []
+
+    # Stage A (candidate mining) needs every recording; once it's done,
+    # find_pvl_only means only the PVL folders' files are needed at all.
+    if find_pvl_only and candidates_id:
+        files = [f for f in files if folder_to_pvl_id.get(f['_source_folder_id'])]
+        print(f"find_pvl_only: candidates already built -- embedding/finding only "
+              f"{len(files)} file(s) from folders with a PVL")
 
     # All three stages funnel through here now -- stage A needs every
     # recording's audio to mine candidates from, and stage C (which this
@@ -1393,11 +1414,16 @@ def handle_extend(job_input):
             output_folder_name = f"motif_extend_find_{timestamp}"
             run_output_folder_id = create_output_folder(service, parent_folder_for_output, output_folder_name)
 
+            find_targets = [e for e in embedded if e["pvl_file_id"]] if find_pvl_only else embedded
+            if find_pvl_only:
+                print(f"find_pvl_only: running find on {len(find_targets)} of {len(embedded)} file(s) "
+                      f"(folders with a PVL)")
+
             results = []
-            for i, e in enumerate(embedded):
+            for i, e in enumerate(find_targets):
                 name = e["file_info"]["name"]
                 stem = e["stem"]
-                print(f"\n[{i + 1}/{len(embedded)}] {name}")
+                print(f"\n[{i + 1}/{len(find_targets)}] {name}")
                 try:
                     restore_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
 
