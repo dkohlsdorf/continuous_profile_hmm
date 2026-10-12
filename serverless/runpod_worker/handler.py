@@ -653,28 +653,6 @@ HOTCODED_NAME = "hotcoded.out"
 HOTCODING_META_NAME = "hotcoding_meta.json"
 
 
-def first_file_pvl_rows(dataframes):
-    """
-    Concatenate per-recording annotated_motif_hits.csv frames, keeping each
-    encounter's PVL sighting rows from its first recording only.
-    annotate.py copies an encounter's whole PVL into every recording of it,
-    so an encounter with several recordings (e.g. E1234_a/E1234_b) would
-    otherwise list every sighting once per recording. Motif rows (the ones
-    whose shotlog::BEHdescription is a submodel id, as in
-    pvl_feature_extractor.filter_rows()) are all kept -- each is a real
-    detection in its own file, told apart by audio_path/audio_file_id.
-    """
-    tagged = [d.assign(_file_rank=i) for i, d in enumerate(dataframes)]
-    df = pd.concat(tagged, ignore_index=True)
-    is_motif = pd.to_numeric(df['shotlog::BEHdescription'], errors='coerce').notna()
-    first_rank = df['_file_rank'].where(~is_motif).groupby(df['ENC #']).transform('min')
-    keep = is_motif | (df['_file_rank'] == first_rank)
-    dropped = int((~keep).sum())
-    if dropped:
-        print(f"pvl db: dropped {dropped} PVL row(s) repeated across recordings of the same encounter")
-    return df[keep].drop(columns='_file_rank')
-
-
 def build_and_upload_pvl_db(service, results, run_output_folder_id, ll_thresholds=None):
     """
     Best-effort, called once at the end of a find/extend job (see handler()/
@@ -729,7 +707,7 @@ def build_and_upload_pvl_db(service, results, run_output_folder_id, ll_threshold
 
         print(f"\nBuilding combined pvl db/csv from {len(local_paths)} {ANNOTATED_CSV_NAME} file(s)")
         dataframes = [pvl_feature_extractor.add_path(pd.read_csv(f), f, audio_map) for f in local_paths]
-        df = pvl_feature_extractor.clean(first_file_pvl_rows(dataframes).reset_index(), ll_thresholds)
+        df = pvl_feature_extractor.clean(pd.concat(dataframes).reset_index(), ll_thresholds)
         df = pvl_feature_extractor.context_features(df)
         df = pvl_feature_extractor.actors_features(df)
 

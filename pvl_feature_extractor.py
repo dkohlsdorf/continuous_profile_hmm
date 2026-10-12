@@ -111,13 +111,14 @@ def clean(df, ll_thresholds=None, drop_noise=True):
     )
     df['is_valid_string'] = df['shotlog::BEHdescription'].apply(is_valid_string)
     df = df[['Date', 'ENC #', 'shotlog::AC', 'shotlog::BEHdescription',
-             'shotlog::timecode', 'SPECIAL COMMENTS', 'duration_s', 'audio_path', 'audio_file_id',
+             'shotlog::timecode', 'SPECIAL COMMENTS', 'duration_s', 'stem', 'audio_path', 'audio_file_id',
              'is_valid_string']]
     return df
 
 
 def add_path(df, path, audio_map):
     path = path.split('/')[-2]
+    df['stem'] = path
     df['audio_path'] = audio_map.get(path, 'UNKNOWN').split('/')[-1]
     return df
 
