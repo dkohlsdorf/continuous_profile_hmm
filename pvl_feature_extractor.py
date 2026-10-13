@@ -100,6 +100,8 @@ def filter_rows(df, ll_thresholds=None, drop_noise=True):
 
 def clean(df, ll_thresholds=None, drop_noise=True):
     df = filter_rows(df, ll_thresholds, drop_noise).copy()
+    if 'audio_file_id' not in df.columns:  # annotated before annotate.py's --file-id existed
+        df['audio_file_id'] = None
     df['shotlog::BEHdescription'] = df['shotlog::BEHdescription'].apply(lambda x: is_int(x))
     df['is_motif'] = df['shotlog::BEHdescription'].apply(lambda x: type(x) == int or pd.isna(x) )
     mask = df.is_motif == False 
@@ -109,12 +111,14 @@ def clean(df, ll_thresholds=None, drop_noise=True):
     )
     df['is_valid_string'] = df['shotlog::BEHdescription'].apply(is_valid_string)
     df = df[['Date', 'ENC #', 'shotlog::AC', 'shotlog::BEHdescription',
-             'shotlog::timecode', 'SPECIAL COMMENTS', 'duration_s', 'audio_path', 'is_valid_string']]
+             'shotlog::timecode', 'SPECIAL COMMENTS', 'duration_s', 'stem', 'audio_path', 'audio_file_id',
+             'is_valid_string']]
     return df
 
 
 def add_path(df, path, audio_map):
     path = path.split('/')[-2]
+    df['stem'] = path
     df['audio_path'] = audio_map.get(path, 'UNKNOWN').split('/')[-1]
     return df
 

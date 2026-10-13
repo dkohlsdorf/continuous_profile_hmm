@@ -5,6 +5,7 @@
 #include<random>
 #include<utility>
 #include<set>
+#include<map>
 #include<iostream>
 
 using namespace std;
@@ -166,11 +167,18 @@ const int KMEDOIDS_RESTARTS_DEFAULT = 10;
 // this fraction of the parent's density.
 const double DENSITY_TOLERANCE_DEFAULT = 0.05;
 
+// leaves (optional): filled with medoid -> the instances of the leaf it
+// stopped on, medoid included. A branch that splits further does not pass
+// its own anchor/sample down to either child, so those can end up in no leaf.
 inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &medoids, int epochs, double parent_density,
-		      int restarts = KMEDOIDS_RESTARTS_DEFAULT, double tolerance = DENSITY_TOLERANCE_DEFAULT) {
+		      int restarts = KMEDOIDS_RESTARTS_DEFAULT, double tolerance = DENSITY_TOLERANCE_DEFAULT,
+		      map<int, vector<int>> *leaves = nullptr) {
   int n = instances.size();
   if(n <= 2) {
     medoids.insert(instances.begin(), instances.end());
+    if(leaves) {
+      for(int i : instances) (*leaves)[i] = {i};
+    }
     return;
   }
 
@@ -248,14 +256,22 @@ inline void kmedoids(DistanceManagement &x, vector<int> &instances, set<int> &me
   double tolerant_parent_density = parent_density * (1.0 - tolerance);
 
   if(best_anchor_density > tolerant_parent_density) {
-    kmedoids(x, best_anchor_inst, medoids, epochs, best_anchor_density, restarts, tolerance);
+    kmedoids(x, best_anchor_inst, medoids, epochs, best_anchor_density, restarts, tolerance, leaves);
   } else {
     medoids.insert(best_anchor);
+    if(leaves) {
+      (*leaves)[best_anchor] = best_anchor_inst;
+      (*leaves)[best_anchor].push_back(best_anchor);
+    }
   }
   if(best_sample_density > tolerant_parent_density) {
-    kmedoids(x, best_sample_inst, medoids, epochs, best_sample_density, restarts, tolerance);
+    kmedoids(x, best_sample_inst, medoids, epochs, best_sample_density, restarts, tolerance, leaves);
   } else {
     medoids.insert(best_sample);
+    if(leaves) {
+      (*leaves)[best_sample] = best_sample_inst;
+      (*leaves)[best_sample].push_back(best_sample);
+    }
   }
 }
 

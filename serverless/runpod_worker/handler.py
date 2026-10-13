@@ -85,6 +85,14 @@ Extend mode:
                                     # stage; a length mismatch against
                                     # gdrive_folder_id is a hard error, not
                                     # a silent misalignment.
+        "find_pvl_only": false,     # optional, default false -- true runs
+                                    # the find stage only on files from
+                                    # folders with a pvl_file_id. Candidate
+                                    # mining/training still use every
+                                    # folder, and once candidates.pkl exists
+                                    # the non-PVL folders aren't even
+                                    # downloaded/embedded. Needs at least
+                                    # one non-null pvl_file_id.
         "min_region_frames": 10,    # optional, default 10 -- shortest
                                     # contiguous non-NOISE run (in frames)
                                     # to keep as a new training candidate
@@ -127,6 +135,24 @@ Extend mode:
                                     # n_sub_models * n_match_states); raise
                                     # this to force richer models. See
                                     # run_train_candidates()'s docstring.
+        "submodel_construction": "medoid",  # optional, default "medoid" --
+                                    # how each sub-model's emissions (and
+                                    # dwell/entry transitions) are estimated
+                                    # from its DTW leaf cluster:
+                                    #   "medoid": the medoid alone (as before)
+                                    #   "all_exemplar_shared_variance": medoid
+                                    #     states/means, one variance shared
+                                    #     by all states, pooled from every
+                                    #     cluster member
+                                    #   "all_exemplar_construction": means and
+                                    #     variances from the medoid plus its
+                                    #     nearest cluster members
+                                    # Both all_exemplar modes pool all
+                                    # members' alignments into the
+                                    # transitions. Only used when a model is
+                                    # trained -- delete phmm_extended.pkl in
+                                    # motif_extend_state to retrain. See
+                                    # train-candidates' --variance.
     The candidates-building stage also uploads l2_<timestamp>.csv/.wav into
     the "motif_extend_state" folder -- that cycle's newly-mined regions, in
     the same starts,stops-into-one-wav format train's own csv_path/wav_path
@@ -245,6 +271,12 @@ EXTEND_STATE_FOLDER_NAME = "motif_extend_state"
 EXTEND_CANDIDATES_NAME = "candidates.pkl"
 EXTEND_MODEL_NAME = "phmm_extended.pkl"
 EXTEND_TRAINING_METADATA_NAME = "training_metadata.json"
+# Same names motif_discovery.py writes them under (CANDIDATE_SOURCES_NAME /
+# CANDIDATE_MEDOIDS_NAME there), plus the per-recording summary built from
+# both after training -- see candidate_stats().
+EXTEND_CANDIDATE_SOURCES_NAME = "candidate_sources.csv"
+EXTEND_CANDIDATE_MEDOIDS_NAME = "candidate_medoids.csv"
+EXTEND_CANDIDATE_STATS_NAME = "candidate_stats.csv"
 
 # motif_hits.csv + submodel_<n>_hits.wav are this run's deliverables.
 # embeddings.pkl and noise_embeddings.pkl both go to the persistent Drive
@@ -373,13 +405,20 @@ def list_audio_files(service, folder_id):
         f"mimeType='audio/mp4' or mimeType='audio/x-m4a' or mimeType='audio/m4a' or "
         f"{name_clauses}) and trashed=false"
     )
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType)",
-        pageSize=1000,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
+    files, page_token = [], None
+    while True:
+        results = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        files.extend(results.get('files', []))
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
 
     # The Drive query's "name contains '<ext>'" clauses can match a
     # Google-native file (Doc/Sheet/Slides/etc.) whose name merely contains
@@ -387,7 +426,7 @@ def list_audio_files(service, folder_id):
     # download (only export), so exclude any Google Workspace mimeType and
     # require the name to actually end in one of AUDIO_EXTENSIONS.
     return [
-        f for f in results.get('files', [])
+        f for f in files
         if not f.get('mimeType', '').startswith('application/vnd.google-apps')
         and f['name'].lower().endswith(AUDIO_EXTENSIONS)
     ]
@@ -597,7 +636,7 @@ def encounter_from_filename(stem):
     return int(stem.split('_')[0][1:])
 
 
-def run_annotate(output_path, pvl_path, encounter):
+def run_annotate(output_path, pvl_path, encounter, file_id=None):
     """
     Best-effort: merge this recording's motif_hits.csv into the matching
     rows of the job's PVL spreadsheet via annotate.py, writing
@@ -606,8 +645,12 @@ def run_annotate(output_path, pvl_path, encounter):
     Never raises: an encounter that isn't in this PVL, or any other
     annotate.py failure, must not fail a file that find already succeeded
     on -- it just means no annotated_motif_hits.csv gets uploaded for it.
+    file_id (the recording's Drive file id) lands in every row's
+    audio_file_id, so the audio can be fetched straight from pvl.db.
     """
     cmd = ['python', '-u', ANNOTATE_SCRIPT, output_path, pvl_path, '--encounter', str(encounter)]
+    if file_id:
+        cmd += ['--file-id', file_id]
     result = subprocess.run(cmd, cwd=APP_DIR, capture_output=True, text=True)
     if result.returncode != 0:
         last_line = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
@@ -751,6 +794,75 @@ def _as_folder_id_list(value):
     return list(value)
 
 
+def dedupe_by_stem(files, has_pvl=None):
+    """
+    Keep one file per recording stem. Every per-recording artifact (the
+    embeddings cache entry, the find output folder, pvl_feature_extractor's
+    audio_map) is keyed by stem, so two files sharing one -- the same
+    recording in overlapping folders, or a .wav next to an .m4a -- would
+    otherwise silently mix one file's cached embeddings with the other's
+    audio.
+
+    files must be in priority order (folder order first). Within one folder
+    the Drive listing order isn't guaranteed, so ties there go to the
+    alphabetically first name, keeping the choice stable across the
+    separate submissions of an extend job family. has_pvl(file) -> bool,
+    when given, lets a copy whose folder has a PVL win over an earlier one
+    whose folder doesn't, so dedupe never costs a recording its annotation.
+    Returns (kept, dropped) -- both lists of file dicts, kept in input order.
+    """
+    folder_rank = {}
+    for f in files:
+        folder_rank.setdefault(f.get('_source_folder_id'), len(folder_rank))
+    ordered = sorted(files, key=lambda f: (folder_rank[f.get('_source_folder_id')], f['name']))
+
+    kept = {}
+    for f in ordered:
+        stem = Path(f['name']).stem
+        current = kept.get(stem)
+        if current is None or (has_pvl and not has_pvl(current) and has_pvl(f)):
+            kept[stem] = f
+    kept_ids = {id(f) for f in kept.values()}
+    return ([f for f in ordered if id(f) in kept_ids],
+            [f for f in ordered if id(f) not in kept_ids])
+
+
+def _log_dedupe(kept, dropped):
+    if not dropped:
+        return
+    kept_by_stem = {Path(f['name']).stem: f for f in kept}
+    print(f"Dedupe by stem: kept {len(kept)} recording(s), dropped {len(dropped)} same-stem duplicate(s):")
+    for f in dropped:
+        k = kept_by_stem[Path(f['name']).stem]
+        print(f"  dropped {f.get('_source_folder_id') or ''}/{f['name']} "
+              f"(kept {k.get('_source_folder_id') or ''}/{k['name']})")
+
+
+def candidate_stats(sources, medoids):
+    """
+    Per source recording: how many non-NOISE regions extend-candidates found
+    in it (n_found), how many were long enough (min_region_frames) to join
+    the candidate pool training ran on (n_used_for_training), and how many
+    of those the DTW filter kept as medoids (n_medoids). sources/medoids are
+    candidate_sources.csv/candidate_medoids.csv. The baked pool shows up as
+    one "baked" row. encounter/year come from the stem's leading MMDDYYNN
+    code (e.g. "08162401_..." -> 8162401, 2024); blank when the stem doesn't
+    start with one.
+    """
+    df = sources.assign(found=sources["start_frame"].notna() | sources["candidate_index"].notna(),
+                        medoid=sources["candidate_index"].isin(medoids["candidate_index"]))
+    stats = df.groupby("stem").agg(
+        n_found=("found", "sum"),
+        n_used_for_training=("candidate_index", "count"),
+        n_medoids=("medoid", "sum"),
+    ).reset_index()
+    code = stats["stem"].str.split("_").str[0]
+    valid = code.str.match(r"^\d{8}$")
+    stats.insert(0, "encounter", pd.to_numeric(code.str[1:].where(valid)).astype("Int64"))
+    stats.insert(2, "year", (2000 + pd.to_numeric(code.str[4:6].where(valid))).astype("Int64"))
+    return stats
+
+
 def _as_pvl_id_list(value, n):
     """
     pvl_file_id (extend mode only) accepts: omitted (no PVL for any
@@ -817,9 +929,17 @@ def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidat
     ], 'extend-candidates')
 
 
+# submodel_construction job input -> train-candidates' --variance
+SUBMODEL_CONSTRUCTION_MODES = {
+    "medoid": "medoid",
+    "all_exemplar_shared_variance": "shared",
+    "all_exemplar_construction": "cluster",
+}
+
+
 def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
                           dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None,
-                          dtw_norm=None, dtw_zscore=False):
+                          dtw_norm=None, dtw_zscore=False, variance='medoid'):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -845,6 +965,9 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
     make BIC floor n_match_states at the sweep's minimum regardless of how
     many segments the true motif shape actually needs. None (the default)
     omits the flag, same as the others above.
+
+    variance forwards to train-candidates' --variance ('medoid', 'shared'
+    or 'cluster', see SUBMODEL_CONSTRUCTION_MODES); 'medoid' omits the flag.
     """
     cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
@@ -865,6 +988,8 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         cmd += ['--dtw-norm', dtw_norm]
     if dtw_zscore:
         cmd.append('--dtw-zscore')
+    if variance != 'medoid':
+        cmd += ['--variance', variance]
     _stream_subprocess(cmd, 'train-candidates')
 
 
@@ -1027,7 +1152,7 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
                 print(f"  (annotation skipped: couldn't read an encounter number from '{name}' "
                       f"-- expected \"E<number>_...\": {e})")
             else:
-                run_annotate(output_path, pvl_path, encounter)
+                run_annotate(output_path, pvl_path, encounter, file_id=file_info['id'])
 
         embeddings_uploaded = False
         if embeddings_cache_folder_id and not embeddings_cached and os.path.exists(embeddings_path):
@@ -1120,12 +1245,17 @@ def handle_extend(job_input):
                                  --min-match-states (omitted, using
                                  motif_discovery.py's own CLI defaults, when
                                  not given); see run_train_candidates()
+        submodel_construction -- default "medoid"; see SUBMODEL_CONSTRUCTION_MODES
+                                 and the module docstring
         noise_components, noise_var_scale, hit_gap_seconds, require_full_match
                               -- same meaning as find's, used only at the find stage
         pvl_file_id           -- one id shared by every folder, or a list matched
                                  positionally to gdrive_folder_id (null for a
                                  folder with no PVL); see _as_pvl_id_list(). Also
                                  only matters at the find stage.
+        find_pvl_only         -- default False; True restricts the find stage
+                                 (and, once candidates exist, embedding) to
+                                 folders with a pvl_file_id
 
     Returns a dict with "stage": "find" (this always finishes there now)
     and a "stages_completed" list saying which of candidates_built /
@@ -1154,6 +1284,11 @@ def handle_extend(job_input):
     min_match_states = int(min_match_states) if min_match_states is not None else None
     dtw_norm = job_input.get('dtw_norm')
     dtw_zscore = bool(job_input.get('dtw_zscore', False))
+    submodel_construction = job_input.get('submodel_construction', 'medoid')
+    if submodel_construction not in SUBMODEL_CONSTRUCTION_MODES:
+        return {"error": f"submodel_construction must be one of {sorted(SUBMODEL_CONSTRUCTION_MODES)}, "
+                         f"got {submodel_construction!r}"}
+    variance = SUBMODEL_CONSTRUCTION_MODES[submodel_construction]
     try:
         ll_thresholds = _parse_ll_thresholds(job_input.get('ll_thresholds'))
         gap_dwell_frames, repeat_prob = _parse_search_transitions(job_input)
@@ -1164,6 +1299,9 @@ def handle_extend(job_input):
     except ValueError as e:
         return {"error": str(e)}
     folder_to_pvl_id = dict(zip(gdrive_folder_ids, pvl_ids_by_folder))
+    find_pvl_only = bool(job_input.get('find_pvl_only', False))
+    if find_pvl_only and not any(pvl_ids_by_folder):
+        return {"error": "find_pvl_only is set but no folder has a pvl_file_id"}
 
     service = get_drive_service()
     # output_gdrive_folder_id, or the first input folder if not given -- same
@@ -1183,6 +1321,8 @@ def handle_extend(job_input):
     if not files:
         return {"error": "No WAV/M4A files found in the specified Google Drive folder(s)"}
     print(f"Found {len(files)} audio files total across {len(gdrive_folder_ids)} folder(s)")
+    files, dropped = dedupe_by_stem(files, has_pvl=lambda f: bool(folder_to_pvl_id.get(f['_source_folder_id'])))
+    _log_dedupe(files, dropped)
 
     state_folder_id = find_or_create_folder(service, parent_folder_for_output, EXTEND_STATE_FOLDER_NAME)
     embeddings_cache_folder_id = find_or_create_folder(service, parent_folder_for_output, EMBEDDINGS_CACHE_FOLDER_NAME)
@@ -1193,6 +1333,13 @@ def handle_extend(job_input):
     candidates_id = find_file(service, state_folder_id, EXTEND_CANDIDATES_NAME)
     model_id = find_file(service, state_folder_id, EXTEND_MODEL_NAME) if candidates_id else None
     stages_completed = []
+
+    # Stage A (candidate mining) needs every recording; once it's done,
+    # find_pvl_only means only the PVL folders' files are needed at all.
+    if find_pvl_only and candidates_id:
+        files = [f for f in files if folder_to_pvl_id.get(f['_source_folder_id'])]
+        print(f"find_pvl_only: candidates already built -- embedding/finding only "
+              f"{len(files)} file(s) from folders with a PVL")
 
     # All three stages funnel through here now -- stage A needs every
     # recording's audio to mine candidates from, and stage C (which this
@@ -1272,6 +1419,8 @@ def handle_extend(job_input):
 
                 print(f"Uploading combined candidates to extend state folder: {EXTEND_CANDIDATES_NAME}")
                 upload_file(service, state_folder_id, combined_local, EXTEND_CANDIDATES_NAME)
+                upload_file(service, state_folder_id, os.path.join(embroot, EXTEND_CANDIDATE_SOURCES_NAME),
+                            EXTEND_CANDIDATE_SOURCES_NAME, mime_type='text/csv')
 
                 # This cycle's freshly-mined regions, in the same
                 # starts,stops-into-one-wav format train's own csv_path/
@@ -1305,7 +1454,7 @@ def handle_extend(job_input):
                 run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
                                       dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
                                       min_match_states=min_match_states, dtw_norm=dtw_norm,
-                                      dtw_zscore=dtw_zscore)
+                                      dtw_zscore=dtw_zscore, variance=variance)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
@@ -1316,6 +1465,21 @@ def handle_extend(job_input):
                 metrics_local = os.path.join(train_output, 'metrics.csv')
                 if os.path.exists(metrics_local):
                     upload_file(service, state_folder_id, metrics_local, 'metrics.csv')
+
+                medoids_local = os.path.join(train_output, EXTEND_CANDIDATE_MEDOIDS_NAME)
+                upload_file(service, state_folder_id, medoids_local, EXTEND_CANDIDATE_MEDOIDS_NAME,
+                            mime_type='text/csv')
+                sources_id = find_file(service, state_folder_id, EXTEND_CANDIDATE_SOURCES_NAME)
+                if sources_id:
+                    sources_local = os.path.join(train_work_dir, EXTEND_CANDIDATE_SOURCES_NAME)
+                    download_file(service, sources_id, sources_local)
+                    stats_local = os.path.join(train_work_dir, EXTEND_CANDIDATE_STATS_NAME)
+                    candidate_stats(pd.read_csv(sources_local), pd.read_csv(medoids_local)).to_csv(stats_local, index=False)
+                    print(f"Uploading per-recording candidate stats to extend state folder: {EXTEND_CANDIDATE_STATS_NAME}")
+                    upload_file(service, state_folder_id, stats_local, EXTEND_CANDIDATE_STATS_NAME, mime_type='text/csv')
+                else:
+                    print(f"No {EXTEND_CANDIDATE_SOURCES_NAME} in extend state folder (candidates built before it "
+                          f"existed) -- skipping {EXTEND_CANDIDATE_STATS_NAME}")
             finally:
                 shutil.rmtree(train_work_dir, ignore_errors=True)
 
@@ -1355,11 +1519,16 @@ def handle_extend(job_input):
             output_folder_name = f"motif_extend_find_{timestamp}"
             run_output_folder_id = create_output_folder(service, parent_folder_for_output, output_folder_name)
 
+            find_targets = [e for e in embedded if e["pvl_file_id"]] if find_pvl_only else embedded
+            if find_pvl_only:
+                print(f"find_pvl_only: running find on {len(find_targets)} of {len(embedded)} file(s) "
+                      f"(folders with a PVL)")
+
             results = []
-            for i, e in enumerate(embedded):
+            for i, e in enumerate(find_targets):
                 name = e["file_info"]["name"]
                 stem = e["stem"]
-                print(f"\n[{i + 1}/{len(embedded)}] {name}")
+                print(f"\n[{i + 1}/{len(find_targets)}] {name}")
                 try:
                     restore_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
 
@@ -1379,7 +1548,7 @@ def handle_extend(job_input):
                             print(f"  (annotation skipped: couldn't read an encounter number from '{name}' "
                                   f"-- expected \"E<number>_...\": {err})")
                         else:
-                            run_annotate(e["output_path"], pvl_path, encounter)
+                            run_annotate(e["output_path"], pvl_path, encounter, file_id=e["file_info"]["id"])
                     file_output_folder_id = create_output_folder(service, run_output_folder_id, stem)
                     uploaded = upload_folder_contents(service, file_output_folder_id, e["output_path"],
                                                        skip_names=UPLOAD_SKIP_NAMES)
@@ -1484,6 +1653,8 @@ def handler(job):
         if not files:
             return {"error": "No WAV/M4A files found in the specified Google Drive folder"}
         print(f"Found {len(files)} audio files")
+        files, dropped = dedupe_by_stem(files)
+        _log_dedupe(files, dropped)
 
         parent_folder_for_output = output_gdrive_folder_id or gdrive_folder_id
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')

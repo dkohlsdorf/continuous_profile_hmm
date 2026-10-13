@@ -18,11 +18,14 @@ output folders aren't named this way, rename them (or symlink) before
 calling this, or pass --encounter to override the folder-name guess.
 
 Usage:
-    python annotate.py <output_folder> <pvl_path> [--encounter N]
+    python annotate.py <output_folder> <pvl_path> [--encounter N] [--file-id ID]
 
     output_folder   a `find` output directory containing motif_hits.csv
                      (written next to it: annotated_motif_hits.csv)
     pvl_path        the PVL .xlsx shotlog
+    --file-id       the recording's Google Drive file id, written to every
+                     row's audio_file_id (empty if not given) so the audio
+                     can be downloaded later straight from the annotation
 
 Column mapping (find -> PVL shotlog):
     classification        -> shotlog::AC
@@ -81,7 +84,7 @@ def process_pvl(pvl_path):
     return df
 
 
-def annotate_one(output_folder, pvl_path, encounter=None):
+def annotate_one(output_folder, pvl_path, encounter=None, file_id=None):
     """
     Merge output_folder/motif_hits.csv into pvl_path's rows for one
     encounter, writing output_folder/annotated_motif_hits.csv. Returns the
@@ -130,6 +133,7 @@ def annotate_one(output_folder, pvl_path, encounter=None):
     annotated = pd.concat([motifs, filtered])
     annotated = annotated.sort_values('shotlog::timecode')
     annotated = annotated[PVL_COLUMNS]
+    annotated['audio_file_id'] = file_id
 
     annotated_path = output_folder / 'annotated_motif_hits.csv'
     annotated.to_csv(annotated_path)
@@ -144,10 +148,12 @@ if __name__ == "__main__":
     parser.add_argument("pvl_path", help="PVL .xlsx shotlog")
     parser.add_argument("--encounter", type=int, default=None,
                          help="override the encounter number instead of guessing it from output_folder's name")
+    parser.add_argument("--file-id", default=None,
+                         help="the recording's Google Drive file id, written to every row's audio_file_id")
     args = parser.parse_args()
 
     try:
-        annotate_one(args.output_folder, args.pvl_path, encounter=args.encounter)
+        annotate_one(args.output_folder, args.pvl_path, encounter=args.encounter, file_id=args.file_id)
     except (ValueError, OSError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
