@@ -101,9 +101,9 @@ LABEL_MAP = {
 }
 
 
+def class_probabilities(y):
+    return torch.softmax(y[0, 0, :], dim=0).detach().cpu().numpy()
+
+
 def classify(y):
-    probs = torch.softmax(y[0, 0, :], dim=0).detach().cpu().numpy()
-    confidence = probs.max()
-    predicted_class = int(probs.argmax())
-    label = LABEL_MAP[predicted_class]
-    return label
+    return LABEL_MAP[int(class_probabilities(y).argmax())]
