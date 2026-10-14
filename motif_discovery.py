@@ -88,13 +88,15 @@ Besides the model pickle and metrics.csv, `train` also writes:
     cleared first, so re-running (e.g. against cached embeddings.pkl
     with different --noise-* settings) doesn't mix stale clips from the
     old run with fresh ones.
-  - embeddings.pkl: cached (embeddings, classifications, step_samples)
-    for the whole file, since embedding a large recording end to end is
+  - embeddings.pkl: cached (embeddings, classifications, step_samples,
+    sample_rate, class_probs) for the whole file, since embedding a large recording end to end is
     the slow part here (no candidates.pkl equivalent to reuse -- this is
     a continuous scan, not per-candidate slices) and you'll often want
     to try more than one model against the same target file. A cache
     written before classifications were added is a 2-tuple and won't
-    unpack against this -- delete it to force a recompute.
+    unpack against this -- delete it to force a recompute. A cache written
+    before class_probs were added (a 4-tuple) still loads; only
+    extend-candidates --viterbi-smoothing needs class_probs.
 
 Usage:
     python motif_discovery.py train L2.csv L2.wav output_dir
@@ -132,7 +134,8 @@ torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 
 from lib_phmm.config import CONFIG
 from lib_phmm.model import whisper_model_v2, whisper_processor
-from lib_phmm.signals import load_filtered_waveform, process, classify
+from lib_phmm.signals import load_filtered_waveform, process, classify, class_probabilities, LABEL_MAP
+from lib_phmm import viterbi_smoothing
 from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid, VARIANCE_MODES
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
@@ -273,28 +276,40 @@ def load_raw_resampled(wav_path, target_sample_rate):
     return waveform
 
 
+def load_embeddings_cache(embeddings_path):
+    """
+    (embeddings, classifications, step_samples, sample_rate, class_probs)
+    from an embeddings.pkl; class_probs is None for a cache written before
+    they were stored (a 4-tuple).
+    """
+    with open(embeddings_path, "rb") as f:
+        cached = pkl.load(f)
+    if len(cached) == 4:
+        return (*cached, None)
+    return cached
+
+
 def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=None):
     """
     Embed one file via embed_full_file(), caching to output_path/
     embeddings.pkl in the (embeddings, classifications, step_samples,
-    sample_rate) shape find_in_file() and `extend`'s candidate extraction
-    both read. Shared so a later `find`/`extend-candidates` pointed at the
+    sample_rate, class_probs) shape find_in_file() and `extend`'s candidate
+    extraction both read (see load_embeddings_cache()). Shared so a later `find`/`extend-candidates` pointed at the
     same output_path reuses this instead of re-embedding.
     """
     output_path.mkdir(parents=True, exist_ok=True)
     embeddings_path = output_path / "embeddings.pkl"
     if embeddings_path.exists():
-        with open(embeddings_path, "rb") as f:
-            embeddings, classifications, step_samples, sample_rate = pkl.load(f)
+        embeddings, classifications, step_samples, sample_rate, _ = load_embeddings_cache(embeddings_path)
         print(f"Loaded cached embeddings from: {embeddings_path}")
     else:
         whisper_model = whisper_model_v2()
         processor     = whisper_processor()
-        embeddings, classifications, step_samples, sample_rate = embed_full_file(
+        embeddings, classifications, step_samples, sample_rate, class_probs = embed_full_file(
             wav_path, whisper_model, processor, verbose=verbose,
             target_sample_rate=target_sample_rate)
         with open(embeddings_path, "wb") as f:
-            pkl.dump((embeddings, classifications, step_samples, sample_rate), f)
+            pkl.dump((embeddings, classifications, step_samples, sample_rate, class_probs), f)
     print(f"{len(embeddings)} windows embedded ({step_samples} samples/window hop, {sample_rate} Hz)")
     if sample_rate != CONFIG['sampling_rate']:
         # See find_in_file()'s identical warning -- nothing in this pipeline
@@ -526,12 +541,14 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None, t
     Embed an entire (potentially long) recording via the same sliding
     window as load_candidates(), but continuously across the whole file
     instead of per-candidate slices -- for `find`, not `train`. Returns
-    (embeddings, classifications, step_samples, sample_rate): an
-    (n_windows, D) array, a parallel list of per-window
+    (embeddings, classifications, step_samples, sample_rate, class_probs):
+    an (n_windows, D) array, a parallel list of per-window
     BURST/ECHO/UP/DOWN/NOISE labels (see lib_phmm.signals.classify()/
     LABEL_MAP), the sample hop between windows (needed to convert frame
-    indices in a Viterbi path back to sample offsets), and the sample rate
-    those offsets are in.
+    indices in a Viterbi path back to sample offsets), the sample rate
+    those offsets are in, and the classifier's (n_windows, n_classes)
+    softmax in LABEL_MAP order that the labels are the argmax of (what
+    lib_phmm.viterbi_smoothing decodes).
 
     sample_rate is the file's own rate, or target_sample_rate when
     resampling to it (see load_waveform_at()). It is NOT
@@ -554,11 +571,11 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None, t
         log_every = max(1, n_expected // 20)
 
     raw_embeddings = []
-    classifications = []
+    class_probs = []
     start_time = time.time() if verbose else None
     for i, result in enumerate(process(waveform, model, processor)):
         raw_embeddings.append(result['embeddings'].detach().cpu().numpy())
-        classifications.append(classify(result['classifications']))
+        class_probs.append(class_probabilities(result['classifications']))
         if verbose and ((i + 1) % log_every == 0 or i + 1 == n_expected):
             elapsed = time.time() - start_time
             rate = (i + 1) / elapsed if elapsed > 0 else 0.0
@@ -568,7 +585,9 @@ def embed_full_file(wav_path, model, processor, verbose=False, log_every=None, t
 
     embeddings = np.array(raw_embeddings)
     embeddings = embeddings.reshape((embeddings.shape[0], embeddings.shape[2]))
-    return embeddings, classifications, step_samples, sr
+    class_probs = np.array(class_probs)
+    classifications = [LABEL_MAP[int(i)] for i in class_probs.argmax(axis=1)]
+    return embeddings, classifications, step_samples, sr, class_probs
 
 
 WHISTLE_LABEL = 'WHISTLE'
@@ -1014,7 +1033,7 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
         # Same target rate as the search audio: the noise model is one side
         # of a likelihood ratio against the match states, so it has to be
         # fit in the same domain or the comparison is meaningless.
-        embeddings, _, step_samples, _ = embed_full_file(noise_wav_path, whisper_model, processor,
+        embeddings, _, step_samples, _, _ = embed_full_file(noise_wav_path, whisper_model, processor,
                                                           verbose=verbose,
                                                           target_sample_rate=target_sample_rate)
         with open(embeddings_path, "wb") as f:
@@ -1259,6 +1278,12 @@ def run_extend_candidates(args):
     file with no audio.wav next to its embeddings.pkl still contributes its
     regions to candidates.pkl, just not to this csv/wav pair. Skipped
     entirely if no file has one.
+
+    With --viterbi-smoothing the regions come from the classifier output
+    smoothed by lib_phmm.viterbi_smoothing instead of its raw argmax, and
+    the candidates carry the smoothed labels. Needs the class_probs the
+    embeddings cache stores since they were added -- an older cache has to
+    be re-embedded.
     """
     with open(args.baked_candidates_path, "rb") as f:
         baked = pkl.load(f)
@@ -1282,8 +1307,12 @@ def run_extend_candidates(args):
     cursor = 0
     combined_sample_rate = None
     for path in embeddings_files:
-        with open(path, "rb") as f:
-            embeddings, classifications, step_samples, sample_rate = pkl.load(f)
+        embeddings, classifications, step_samples, sample_rate, class_probs = load_embeddings_cache(path)
+        if args.viterbi_smoothing:
+            if class_probs is None:
+                raise ValueError(f"{path} has no class probabilities (cached before they were stored) -- "
+                                 f"re-embed it to use --viterbi-smoothing")
+            classifications = viterbi_smoothing.smooth(class_probs)
         spans = find_non_noise_spans(classifications, min_size=args.min_region_frames)
         extracted = [(embeddings[start:stop], embeddings[start:stop], classifications[start:stop])
                      for start, stop in spans]
@@ -1457,6 +1486,7 @@ if __name__ == "__main__":
     extend_candidates_parser.add_argument("embeddings_dir", help="directory containing one <stem>/embeddings.pkl per file (as written by `embed`'s directory mode), or a single embeddings.pkl directly inside it. If a <stem>/audio.wav (the mono audio that embeddings.pkl was embedded from) sits alongside it, that file's new regions are also sliced out and written to l2_<timestamp>.csv/.wav next to output_candidates_path, in the same starts,stops-into-one-wav format train's own input uses.")
     extend_candidates_parser.add_argument("output_candidates_path", help="where to write the combined candidates.pkl (l2_<timestamp>.csv/.wav, if any audio.wav was found, are written into this same directory)")
     extend_candidates_parser.add_argument("--min-region-frames", type=int, default=10, help="shortest contiguous non-NOISE run (in frames) to keep as a new candidate -- shorter runs are dropped as noise-classifier blips. Matches lib_phmm.signals.bounded_regions()'s own default.")
+    extend_candidates_parser.add_argument("--viterbi-smoothing", action="store_true", help="mine regions from the classifier output smoothed by lib_phmm.viterbi_smoothing (HMM over the classifier's probabilities that favours staying in a whistle, then NOISE gaps of up to 6 frames between signal closed) instead of its raw per-frame argmax, whose single-frame NOISE flicker cuts whistles into fragments. Needs embeddings.pkl files written with class probabilities (re-embed older caches). Off by default.")
 
     train_candidates_parser = subparsers.add_parser("train-candidates", help="fit a profile HMM directly from a candidates.pkl (e.g. extend-candidates' combined pool), no CSV/wav required")
     train_candidates_parser.add_argument("candidates_path", help="candidates.pkl to train on")

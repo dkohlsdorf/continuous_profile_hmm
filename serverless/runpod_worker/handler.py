@@ -96,6 +96,17 @@ Extend mode:
         "min_region_frames": 10,    # optional, default 10 -- shortest
                                     # contiguous non-NOISE run (in frames)
                                     # to keep as a new training candidate
+        "viterbi_smoothing": false, # optional, default false -- true mines
+                                    # candidates from the classifier output
+                                    # smoothed by lib_phmm.viterbi_smoothing
+                                    # (extend-candidates --viterbi-smoothing)
+                                    # instead of its flickering argmax. Needs
+                                    # class probabilities, so files are
+                                    # embedded/cached under
+                                    # EMBEDDINGS_CACHE_VERSION_WITH_PROBS.
+                                    # Only affects building candidates.pkl;
+                                    # an extend state folder that already
+                                    # has one is unaffected.
         "all_medoids": true,        # optional, default true (NOT
                                     # train-candidates' own CLI default) --
                                     # every DTW-filtered candidate becomes
@@ -301,6 +312,12 @@ EMBEDDINGS_CACHE_FOLDER_NAME = "motif_embeddings_cache"
 #             audio is now resampled to TRAINING_SAMPLE_RATE, so v1
 #             embeddings describe different audio at a different rate.
 EMBEDDINGS_CACHE_VERSION = "v2"
+# Embeddings now also store the classifier's probabilities (4-tuple ->
+# 5-tuple, see motif_discovery.py's load_embeddings_cache(), which still reads
+# 4-tuples). Only extend's viterbi_smoothing needs them, so only that stage
+# reads and writes entries under this version; everything else keeps using
+# EMBEDDINGS_CACHE_VERSION and its existing entries.
+EMBEDDINGS_CACHE_VERSION_WITH_PROBS = "v3"
 
 # The noise wav is baked into the image and identical for every file, but
 # build_noise_model() caches its embeddings under each run's output_path --
@@ -920,13 +937,17 @@ def run_embed(wav_path, output_path, resample_hz):
     ], 'embed')
 
 
-def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidates_path, min_region_frames):
+def run_extend_candidates(baked_candidates_path, embeddings_dir, output_candidates_path, min_region_frames,
+                          viterbi_smoothing=False):
     """motif_discovery.py extend-candidates -- combine the baked L2 candidates with new ones mined from embeddings_dir."""
-    _stream_subprocess([
+    cmd = [
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'extend-candidates',
         baked_candidates_path, embeddings_dir, output_candidates_path,
         '--min-region-frames', str(min_region_frames),
-    ], 'extend-candidates')
+    ]
+    if viterbi_smoothing:
+        cmd.append('--viterbi-smoothing')
+    _stream_subprocess(cmd, 'extend-candidates')
 
 
 # submodel_construction job input -> train-candidates' --variance
@@ -1238,6 +1259,9 @@ def handle_extend(job_input):
                                  candidates pool/model
         output_gdrive_folder_id  -- same meaning as find's
         min_region_frames    -- default 10, see extend-candidates' own flag
+        viterbi_smoothing     -- default False, see extend-candidates'
+                                 --viterbi-smoothing; only used while building
+                                 candidates.pkl
         all_medoids           -- default True, see run_train_candidates()
         dtw_restarts, dtw_density_tolerance, min_match_states -- optional,
                                  forwarded to train-candidates'
@@ -1269,6 +1293,7 @@ def handle_extend(job_input):
         return {"error": "gdrive_folder_id is required"}
 
     min_region_frames = int(job_input.get('min_region_frames', 10))
+    viterbi_smoothing = bool(job_input.get('viterbi_smoothing', False))
     noise_components = int(job_input.get('noise_components', 6))
     noise_var_scale = float(job_input.get('noise_var_scale', 1.0))
     hit_gap_seconds = float(job_input.get('hit_gap_seconds', 0.5))
@@ -1348,6 +1373,10 @@ def handle_extend(job_input):
     # exactly like `find`'s own embeddings cache, so a call that's only
     # here for stage B/C because stage A already ran on a prior submission
     # doesn't pay to re-decode anything.
+    # Smoothing candidate mining needs the class probabilities only caches
+    # under EMBEDDINGS_CACHE_VERSION_WITH_PROBS are guaranteed to have.
+    smooth_candidates = viterbi_smoothing and not candidates_id
+    cache_version = EMBEDDINGS_CACHE_VERSION_WITH_PROBS if smooth_candidates else EMBEDDINGS_CACHE_VERSION
     work_dirs = []
     embedded = []
     try:
@@ -1355,7 +1384,7 @@ def handle_extend(job_input):
             name = file_info['name']
             stem = Path(name).stem
             print(f"\n[{i + 1}/{len(files)}] embedding {name}")
-            cache_name = f"{stem}.{EMBEDDINGS_CACHE_VERSION}.pkl"
+            cache_name = f"{stem}.{cache_version}.pkl"
             work_dir = tempfile.mkdtemp(prefix='motif_extend_')
             work_dirs.append(work_dir)
             output_path = os.path.join(work_dir, 'output')
@@ -1415,7 +1444,8 @@ def handle_extend(job_input):
                 baked_local = os.path.join(embroot, "baked_candidates.pkl")
                 shutil.copy2(BAKED_CANDIDATES_PATH, baked_local)
                 combined_local = os.path.join(embroot, EXTEND_CANDIDATES_NAME)
-                run_extend_candidates(baked_local, embroot, combined_local, min_region_frames)
+                run_extend_candidates(baked_local, embroot, combined_local, min_region_frames,
+                                      smooth_candidates)
 
                 print(f"Uploading combined candidates to extend state folder: {EXTEND_CANDIDATES_NAME}")
                 upload_file(service, state_folder_id, combined_local, EXTEND_CANDIDATES_NAME)
