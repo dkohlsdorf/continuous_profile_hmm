@@ -1302,7 +1302,15 @@ def run_extend_candidates(args):
     # pool) only for those long enough to become a candidate. A file with no
     # region at all still gets one empty row so it shows up with 0s.
     sources = [(i, "baked", None, None) for i in range(len(baked))]
-    audio_chunks = []
+    # Region audio is streamed straight into the l2 wav (16-bit PCM, as
+    # torchaudio.save wrote it before) -- collecting every clip and
+    # torch.cat-ing them at the end OOM-killed a ~99k-region run.
+    output_path = Path(args.output_candidates_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    csv_path = output_path.parent / f"l2_{dt}.csv"
+    wav_path = output_path.parent / f"l2_{dt}.wav"
+    wav_out = None
     csv_rows = []
     cursor = 0
     combined_sample_rate = None
@@ -1314,8 +1322,12 @@ def run_extend_candidates(args):
                                  f"re-embed it to use --viterbi-smoothing")
             classifications = viterbi_smoothing.smooth(class_probs)
         spans = find_non_noise_spans(classifications, min_size=args.min_region_frames)
-        extracted = [(embeddings[start:stop], embeddings[start:stop], classifications[start:stop])
-                     for start, stop in spans]
+        # .copy(): a bare slice is a view that keeps this file's whole
+        # embeddings/classifications arrays alive for the rest of the run.
+        extracted = []
+        for start, stop in spans:
+            segment = embeddings[start:stop].copy()
+            extracted.append((segment, segment, classifications[start:stop].copy()))
         print(f"  {path.parent.name}: {len(extracted)} non-NOISE region(s) extracted from {len(embeddings)} windows")
         new_candidates.extend(extracted)
         used = {span: len(baked) + len(new_candidates) - len(extracted) + k for k, span in enumerate(spans)}
@@ -1332,6 +1344,11 @@ def run_extend_candidates(args):
                 print(f"    WARNING: {path.parent.name}'s embeddings are {sample_rate} Hz but an "
                       f"earlier file's were {combined_sample_rate} Hz -- resampling to match so "
                       f"every region in the combined wav shares one rate")
+            if wav_out is None:
+                wav_out = wave.open(str(wav_path), 'wb')
+                wav_out.setnchannels(1)
+                wav_out.setsampwidth(2)
+                wav_out.setframerate(combined_sample_rate)
             waveform = load_raw_resampled(audio_path, combined_sample_rate)
             n_samples = waveform.shape[1]
             for start, stop in spans:
@@ -1339,16 +1356,16 @@ def run_extend_candidates(args):
                 sample_stop = min(stop * step_samples, n_samples)
                 if sample_stop <= sample_start:
                     continue
-                clip = waveform[:, sample_start:sample_stop]
-                audio_chunks.append(clip)
-                csv_rows.append((cursor, cursor + clip.shape[1]))
-                cursor += clip.shape[1]
+                clip = waveform[0, sample_start:sample_stop]
+                pcm = (clip.clamp(-1.0, 1.0) * 32767).to(torch.int16).numpy()
+                wav_out.writeframes(pcm.tobytes())
+                csv_rows.append((cursor, cursor + len(pcm)))
+                cursor += len(pcm)
+            del waveform
 
     combined = baked + new_candidates
     print(f"Combined candidate pool: {len(baked)} baked + {len(new_candidates)} new = {len(combined)}")
 
-    output_path = Path(args.output_candidates_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
         pkl.dump(combined, f)
     print(f"Saved combined candidates to {output_path}")
@@ -1358,13 +1375,9 @@ def run_extend_candidates(args):
         .to_csv(sources_path, index=False)
     print(f"Saved per-candidate source recording to {sources_path}")
 
-    if audio_chunks:
-        dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        csv_path = output_path.parent / f"l2_{dt}.csv"
-        wav_path = output_path.parent / f"l2_{dt}.wav"
+    if wav_out is not None:
+        wav_out.close()
         pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_path, index=False)
-        concatenated = torch.cat(audio_chunks, dim=1)
-        torchaudio.save(str(wav_path), concatenated, combined_sample_rate)
         print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_path} / {wav_path} "
               f"(same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
     else:
