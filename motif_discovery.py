@@ -1259,6 +1259,11 @@ def run_embed(args):
     print("==========================================")
 
 
+# Per-part cap for extend-candidates' l2 wavs: 2 GiB keeps well under the
+# 4 GiB RIFF limit and under signed-32-bit readers too.
+L2_WAV_MAX_BYTES = 2 ** 31
+
+
 def run_extend_candidates(args):
     """
     `extend-candidates` -- grow a baked candidates.pkl (e.g. train's
@@ -1307,13 +1312,22 @@ def run_extend_candidates(args):
     # torch.cat-ing them at the end OOM-killed a ~99k-region run.
     output_path = Path(args.output_candidates_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # RIFF/WAV sizes are 32-bit (stdlib wave raises struct.error past
+    # 4 GiB), so the regions are split over l2_<dt>_<part>.csv/.wav pairs,
+    # each a self-contained starts,stops-into-one-wav input for train.
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    csv_path = output_path.parent / f"l2_{dt}.csv"
-    wav_path = output_path.parent / f"l2_{dt}.wav"
     wav_out = None
     csv_rows = []
     cursor = 0
+    part = 0
+    n_regions_written = 0
     combined_sample_rate = None
+
+    def close_part():
+        wav_out.close()
+        csv_part = output_path.parent / f"l2_{dt}_{part:03d}.csv"
+        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_part, index=False)
+        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_part.name} / {csv_part.stem}.wav")
     for path in embeddings_files:
         embeddings, classifications, step_samples, sample_rate, class_probs = load_embeddings_cache(path)
         if args.viterbi_smoothing:
@@ -1344,11 +1358,6 @@ def run_extend_candidates(args):
                 print(f"    WARNING: {path.parent.name}'s embeddings are {sample_rate} Hz but an "
                       f"earlier file's were {combined_sample_rate} Hz -- resampling to match so "
                       f"every region in the combined wav shares one rate")
-            if wav_out is None:
-                wav_out = wave.open(str(wav_path), 'wb')
-                wav_out.setnchannels(1)
-                wav_out.setsampwidth(2)
-                wav_out.setframerate(combined_sample_rate)
             waveform = load_raw_resampled(audio_path, combined_sample_rate)
             n_samples = waveform.shape[1]
             for start, stop in spans:
@@ -1358,9 +1367,19 @@ def run_extend_candidates(args):
                     continue
                 clip = waveform[0, sample_start:sample_stop]
                 pcm = (clip.clamp(-1.0, 1.0) * 32767).to(torch.int16).numpy()
+                if wav_out is not None and (cursor + len(pcm)) * 2 > L2_WAV_MAX_BYTES:
+                    close_part()
+                    part += 1
+                    wav_out, csv_rows, cursor = None, [], 0
+                if wav_out is None:
+                    wav_out = wave.open(str(output_path.parent / f"l2_{dt}_{part:03d}.wav"), 'wb')
+                    wav_out.setnchannels(1)
+                    wav_out.setsampwidth(2)
+                    wav_out.setframerate(combined_sample_rate)
                 wav_out.writeframes(pcm.tobytes())
                 csv_rows.append((cursor, cursor + len(pcm)))
                 cursor += len(pcm)
+                n_regions_written += 1
             del waveform
 
     combined = baked + new_candidates
@@ -1376,10 +1395,9 @@ def run_extend_candidates(args):
     print(f"Saved per-candidate source recording to {sources_path}")
 
     if wav_out is not None:
-        wav_out.close()
-        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_path, index=False)
-        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_path} / {wav_path} "
-              f"(same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
+        close_part()
+        print(f"Wrote {n_regions_written} new-candidate region(s) over {part + 1} l2_{dt}_<part>.csv/.wav "
+              f"pair(s) (same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
     else:
         print("No audio.wav found next to any embeddings.pkl -- skipping l2_<timestamp>.csv/.wav output")
 
