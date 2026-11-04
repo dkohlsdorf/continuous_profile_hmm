@@ -247,6 +247,8 @@ Output:
 import os
 import json
 import base64
+import http.client
+import time
 import binascii
 import shutil
 import sqlite3
@@ -449,14 +451,49 @@ def list_audio_files(service, folder_id):
     ]
 
 
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+def drop_pooled_connections(service):
+    """
+    Close every connection httplib2 has pooled for this service. httplib2
+    reads the response body outside its own error handling, so a connection
+    that died mid-body (IncompleteRead) stays pooled and gets reused.
+    """
+    for conn in service._http.http.connections.values():
+        conn.close()
+    service._http.http.connections.clear()
+
+
 def download_file(service, file_id, local_path):
-    """Download a single Drive file to local_path."""
+    """
+    Download a single Drive file to local_path in DOWNLOAD_CHUNK_BYTES range
+    requests. Drive sometimes drops the connection mid-body
+    (http.client.IncompleteRead), which next_chunk's own num_retries doesn't
+    cover: the failed chunk is retried on a fresh connection with backoff,
+    resuming where the last good chunk ended (the downloader only advances
+    and writes after a chunk arrives whole).
+    """
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     with open(local_path, 'wb') as f:
-        downloader = MediaIoBaseDownload(f, request)
+        downloader = MediaIoBaseDownload(f, request, chunksize=DOWNLOAD_CHUNK_BYTES)
         done = False
+        failures = 0
         while not done:
-            status, done = downloader.next_chunk()
+            try:
+                status, done = downloader.next_chunk(num_retries=5)
+                failures = 0
+            except (http.client.HTTPException, ConnectionError, TimeoutError) as e:
+                failures += 1
+                if failures == DOWNLOAD_ATTEMPTS:
+                    raise
+                wait = 2 ** failures
+                print(f"    Download of {file_id} failed at byte {downloader._progress} ({e!r}), "
+                      f"retrying in {wait}s on a fresh connection "
+                      f"(attempt {failures}/{DOWNLOAD_ATTEMPTS})")
+                drop_pooled_connections(service)
+                time.sleep(wait)
 
 
 def create_output_folder(service, parent_folder_id, folder_name):
