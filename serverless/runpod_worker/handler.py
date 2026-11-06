@@ -1440,6 +1440,13 @@ def handle_extend(job_input):
             embeddings_cached = False
             try:
                 cached_id = find_file(service, embeddings_cache_folder_id, cache_name)
+                if not cached_id and not smooth_candidates:
+                    # A v3 entry (written while building candidates with
+                    # smoothing) is a superset of v2 -- reuse it.
+                    probs_cache_name = f"{stem}.{EMBEDDINGS_CACHE_VERSION_WITH_PROBS}.pkl"
+                    cached_id = find_file(service, embeddings_cache_folder_id, probs_cache_name)
+                    if cached_id:
+                        cache_name = probs_cache_name
                 if cached_id:
                     print(f"  Using cached embeddings from Drive: {cache_name}")
                     download_file(service, cached_id, embeddings_path)
