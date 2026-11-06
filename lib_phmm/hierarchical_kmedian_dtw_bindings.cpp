@@ -1,8 +1,28 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+#include <thread>
 #include "hierarchical_kmedian_dtw.hpp"
 
 namespace py = pybind11;
+
+using Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
+
+// (frames, dims) numpy arrays -> Dataset, without going through one Python
+// float object per value (a list-of-lists of floats is ~4x the raw size).
+static Dataset to_dataset(const std::vector<Array> &sequences) {
+  Dataset dataset;
+  dataset.reserve(sequences.size());
+  for (const Array &a : sequences) {
+    if (a.ndim() != 2) throw py::value_error("each sequence must be a 2-d (frames, dims) array");
+    auto r = a.unchecked<2>();
+    Mat seq(r.shape(0), Vec(r.shape(1)));
+    for (py::ssize_t i = 0; i < r.shape(0); i++)
+      for (py::ssize_t d = 0; d < r.shape(1); d++) seq[i][d] = r(i, d);
+    dataset.push_back(std::move(seq));
+  }
+  return dataset;
+}
 
 // DistanceManagement (in the header) stores a raw Dataset* and never takes
 // ownership -- fine in C++ where the caller controls the dataset's
@@ -19,8 +39,8 @@ static int parse_norm(const std::string &norm) {
 
 class DistanceManager {
 public:
-  DistanceManager(Dataset dataset, int warping_band, const std::string &norm)
-      : dataset(std::move(dataset)), impl(&this->dataset, warping_band, parse_norm(norm)) {}
+  DistanceManager(const std::vector<Array> &sequences, int warping_band, const std::string &norm)
+      : dataset(to_dataset(sequences)), impl(&this->dataset, warping_band, parse_norm(norm)) {}
 
   double distance(int i, int j) {
     return impl.distance(i, j);
@@ -68,6 +88,36 @@ private:
 };
 
 
+// For each query, the index of its DTW-nearest medoid and that distance.
+// Threaded over queries; the GIL is released while the DTWs run.
+static std::pair<std::vector<int>, std::vector<double>> nearest(const std::vector<Array> &queries,
+                                                                const std::vector<Array> &medoids,
+                                                                int warping_band, const std::string &norm) {
+  int norm_id = parse_norm(norm);
+  Dataset q = to_dataset(queries), med = to_dataset(medoids);
+  if (med.empty()) throw py::value_error("medoids must not be empty");
+  std::vector<int> best(q.size(), -1);
+  std::vector<double> best_dist(q.size(), INFINITY);
+  {
+    py::gil_scoped_release release;
+    int n_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; t++) {
+      threads.emplace_back([&, t]() {
+        for (size_t i = t; i < q.size(); i += n_threads) {
+          for (size_t k = 0; k < med.size(); k++) {
+            double d = dtw(q[i], med[k], warping_band, norm_id);
+            if (d < best_dist[i]) { best_dist[i] = d; best[i] = (int)k; }
+          }
+        }
+      });
+    }
+    for (auto &th : threads) th.join();
+  }
+  return {best, best_dist};
+}
+
+
 PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
   m.doc() = "Divisive hierarchical k-medoids clustering under DTW distance";
 
@@ -79,10 +129,16 @@ PYBIND11_MODULE(hierarchical_kmedian_dtw, m) {
         "divides the summed cost by the warp-path length, 'length' by n + m, "
         "'none' returns the summed cost.");
 
+  m.def("nearest", &nearest, py::arg("queries"), py::arg("medoids"), py::arg("warping_band"),
+        py::arg("norm") = "path",
+        "For each query sequence ((frames, dims) array), the index of its "
+        "DTW-nearest medoid and that distance, as (indices, distances). "
+        "Runs on all hardware threads.");
+
   py::class_<DistanceManager>(m, "DistanceManager")
-    .def(py::init<Dataset, int, const std::string &>(), py::arg("dataset"), py::arg("warping_band"),
+    .def(py::init<const std::vector<Array> &, int, const std::string &>(), py::arg("dataset"), py::arg("warping_band"),
          py::arg("norm") = "path",
-         "dataset: list of sequences (each a list of frames/vectors). "
+         "dataset: list of (frames, dims) numpy arrays. "
          "Pairwise DTW distances are computed lazily and cached. "
          "norm: 'path', 'length' or 'none' (see dtw()).")
     .def("distance", &DistanceManager::distance, py::arg("i"), py::arg("j"),

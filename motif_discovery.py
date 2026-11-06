@@ -145,6 +145,9 @@ from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 MAX_MATCH  = 5
 MAX_STATES = 32
 MIN_STATES = 3
+# Cap on the DTW medoid filter's pool -- see --dtw-max-candidates. Around
+# the ~7k-candidate pools it has been run on directly (~17 min locally).
+DTW_MAX_CANDIDATES = 7500
 
 
 def wav_num_samples(wav_path):
@@ -705,6 +708,7 @@ def fit_model_from_candidates(candidates, args):
 
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
     Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/dtw_norm/dtw_zscore/
+    dtw_max_candidates/dtw_seed/
     all_medoids/max_match/min_match_states/flank_dwell_frames/flank_alpha/
     require_full_match/variance/max_members/shrinkage off of args --
     train_parser and train_candidates_parser both define all of these with
@@ -737,6 +741,8 @@ def fit_model_from_candidates(candidates, args):
         zscore=args.dtw_zscore,
         return_members=pooled,
         return_ids=True,
+        max_candidates=args.dtw_max_candidates or None,
+        seed=args.dtw_seed,
     )
     construction = None
     medoid_ids = filtered[-1]
@@ -1259,6 +1265,11 @@ def run_embed(args):
     print("==========================================")
 
 
+# Per-part cap for extend-candidates' l2 wavs: 2 GiB keeps well under the
+# 4 GiB RIFF limit and under signed-32-bit readers too.
+L2_WAV_MAX_BYTES = 2 ** 31
+
+
 def run_extend_candidates(args):
     """
     `extend-candidates` -- grow a baked candidates.pkl (e.g. train's
@@ -1302,10 +1313,27 @@ def run_extend_candidates(args):
     # pool) only for those long enough to become a candidate. A file with no
     # region at all still gets one empty row so it shows up with 0s.
     sources = [(i, "baked", None, None) for i in range(len(baked))]
-    audio_chunks = []
+    # Region audio is streamed straight into the l2 wav (16-bit PCM, as
+    # torchaudio.save wrote it before) -- collecting every clip and
+    # torch.cat-ing them at the end OOM-killed a ~99k-region run.
+    output_path = Path(args.output_candidates_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # RIFF/WAV sizes are 32-bit (stdlib wave raises struct.error past
+    # 4 GiB), so the regions are split over l2_<dt>_<part>.csv/.wav pairs,
+    # each a self-contained starts,stops-into-one-wav input for train.
+    dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    wav_out = None
     csv_rows = []
     cursor = 0
+    part = 0
+    n_regions_written = 0
     combined_sample_rate = None
+
+    def close_part():
+        wav_out.close()
+        csv_part = output_path.parent / f"l2_{dt}_{part:03d}.csv"
+        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_part, index=False)
+        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_part.name} / {csv_part.stem}.wav")
     for path in embeddings_files:
         embeddings, classifications, step_samples, sample_rate, class_probs = load_embeddings_cache(path)
         if args.viterbi_smoothing:
@@ -1314,8 +1342,12 @@ def run_extend_candidates(args):
                                  f"re-embed it to use --viterbi-smoothing")
             classifications = viterbi_smoothing.smooth(class_probs)
         spans = find_non_noise_spans(classifications, min_size=args.min_region_frames)
-        extracted = [(embeddings[start:stop], embeddings[start:stop], classifications[start:stop])
-                     for start, stop in spans]
+        # .copy(): a bare slice is a view that keeps this file's whole
+        # embeddings/classifications arrays alive for the rest of the run.
+        extracted = []
+        for start, stop in spans:
+            segment = embeddings[start:stop].copy()
+            extracted.append((segment, segment, classifications[start:stop].copy()))
         print(f"  {path.parent.name}: {len(extracted)} non-NOISE region(s) extracted from {len(embeddings)} windows")
         new_candidates.extend(extracted)
         used = {span: len(baked) + len(new_candidates) - len(extracted) + k for k, span in enumerate(spans)}
@@ -1339,16 +1371,26 @@ def run_extend_candidates(args):
                 sample_stop = min(stop * step_samples, n_samples)
                 if sample_stop <= sample_start:
                     continue
-                clip = waveform[:, sample_start:sample_stop]
-                audio_chunks.append(clip)
-                csv_rows.append((cursor, cursor + clip.shape[1]))
-                cursor += clip.shape[1]
+                clip = waveform[0, sample_start:sample_stop]
+                pcm = (clip.clamp(-1.0, 1.0) * 32767).to(torch.int16).numpy()
+                if wav_out is not None and (cursor + len(pcm)) * 2 > L2_WAV_MAX_BYTES:
+                    close_part()
+                    part += 1
+                    wav_out, csv_rows, cursor = None, [], 0
+                if wav_out is None:
+                    wav_out = wave.open(str(output_path.parent / f"l2_{dt}_{part:03d}.wav"), 'wb')
+                    wav_out.setnchannels(1)
+                    wav_out.setsampwidth(2)
+                    wav_out.setframerate(combined_sample_rate)
+                wav_out.writeframes(pcm.tobytes())
+                csv_rows.append((cursor, cursor + len(pcm)))
+                cursor += len(pcm)
+                n_regions_written += 1
+            del waveform
 
     combined = baked + new_candidates
     print(f"Combined candidate pool: {len(baked)} baked + {len(new_candidates)} new = {len(combined)}")
 
-    output_path = Path(args.output_candidates_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
         pkl.dump(combined, f)
     print(f"Saved combined candidates to {output_path}")
@@ -1358,15 +1400,10 @@ def run_extend_candidates(args):
         .to_csv(sources_path, index=False)
     print(f"Saved per-candidate source recording to {sources_path}")
 
-    if audio_chunks:
-        dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        csv_path = output_path.parent / f"l2_{dt}.csv"
-        wav_path = output_path.parent / f"l2_{dt}.wav"
-        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_path, index=False)
-        concatenated = torch.cat(audio_chunks, dim=1)
-        torchaudio.save(str(wav_path), concatenated, combined_sample_rate)
-        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_path} / {wav_path} "
-              f"(same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
+    if wav_out is not None:
+        close_part()
+        print(f"Wrote {n_regions_written} new-candidate region(s) over {part + 1} l2_{dt}_<part>.csv/.wav "
+              f"pair(s) (same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
     else:
         print("No audio.wav found next to any embeddings.pkl -- skipping l2_<timestamp>.csv/.wav output")
 
@@ -1453,6 +1490,8 @@ if __name__ == "__main__":
     train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance for medoid filtering: 'path' divides by warp-path length (default; rewards long warp paths over cheap cells and hides duration differences), 'length' divides by n + m (fixed per pair), 'none' keeps the raw sum")
     train_parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across all frames in the candidate pool before DTW medoid filtering, so a few high-variance dimensions don't dominate the frame distance. Only affects which medoids are picked -- the HMM is still built from the unscaled embeddings")
+    train_parser.add_argument("--dtw-max-candidates", type=int, default=DTW_MAX_CANDIDATES, help=f"cluster at most this many candidates (a uniform random sample, seeded by --dtw-seed) in the DTW medoid filter -- its distance table and medoid search are quadratic in the pool size (~80 GB and days at 100k candidates). With --variance shared/cluster, the rest join their DTW-nearest medoid's cluster. Default {DTW_MAX_CANDIDATES}; 0 disables the cap")
+    train_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- n_match_states is the cap on piecewise segments used to compress each candidate (see top_k_switchpoints()/make_hmm()), so raising this floor forces the sweep to only consider models rich enough to represent motifs with more turns/segments than the default floor allows. Useful with --all-medoids: count_params()'s BIC penalty scales with n_sub_models * n_match_states, so a large n_sub_models pool can make BIC floor n_match_states at the sweep's minimum regardless of true motif complexity -- raising this floor is how to override that.")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
@@ -1504,6 +1543,8 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_candidates_parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance for medoid filtering: 'path' divides by warp-path length (default; rewards long warp paths over cheap cells and hides duration differences), 'length' divides by n + m (fixed per pair), 'none' keeps the raw sum")
     train_candidates_parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across all frames in the candidate pool before DTW medoid filtering, so a few high-variance dimensions don't dominate the frame distance. Only affects which medoids are picked -- the HMM is still built from the unscaled embeddings")
+    train_candidates_parser.add_argument("--dtw-max-candidates", type=int, default=DTW_MAX_CANDIDATES, help=f"cluster at most this many candidates (a uniform random sample, seeded by --dtw-seed) in the DTW medoid filter -- its distance table and medoid search are quadratic in the pool size (~80 GB and days at 100k candidates). With --variance shared/cluster, the rest join their DTW-nearest medoid's cluster. Default {DTW_MAX_CANDIDATES}; 0 disables the cap")
+    train_candidates_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_candidates_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- see train's --min-match-states for why this matters especially with --all-medoids")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
