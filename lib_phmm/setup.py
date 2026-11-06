@@ -14,7 +14,8 @@ ext_modules = [
         sources=["hierarchical_kmedian_dtw_bindings.cpp"],
         include_dirs=[pybind11.get_include()],
         language="c++",
-        extra_compile_args=["-std=c++17", "-O2"],
+        extra_compile_args=["-std=c++17", "-O2", "-pthread"],
+        extra_link_args=["-pthread"],  # nearest() uses std::thread
     ),
 ]
 

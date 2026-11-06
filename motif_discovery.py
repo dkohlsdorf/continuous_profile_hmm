@@ -145,6 +145,9 @@ from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 MAX_MATCH  = 5
 MAX_STATES = 32
 MIN_STATES = 3
+# Cap on the DTW medoid filter's pool -- see --dtw-max-candidates. Around
+# the ~7k-candidate pools it has been run on directly (~17 min locally).
+DTW_MAX_CANDIDATES = 7500
 
 
 def wav_num_samples(wav_path):
@@ -705,6 +708,7 @@ def fit_model_from_candidates(candidates, args):
 
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
     Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/dtw_norm/dtw_zscore/
+    dtw_max_candidates/dtw_seed/
     all_medoids/max_match/min_match_states/flank_dwell_frames/flank_alpha/
     require_full_match/variance/max_members/shrinkage off of args --
     train_parser and train_candidates_parser both define all of these with
@@ -737,6 +741,8 @@ def fit_model_from_candidates(candidates, args):
         zscore=args.dtw_zscore,
         return_members=pooled,
         return_ids=True,
+        max_candidates=args.dtw_max_candidates or None,
+        seed=args.dtw_seed,
     )
     construction = None
     medoid_ids = filtered[-1]
@@ -1484,6 +1490,8 @@ if __name__ == "__main__":
     train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance for medoid filtering: 'path' divides by warp-path length (default; rewards long warp paths over cheap cells and hides duration differences), 'length' divides by n + m (fixed per pair), 'none' keeps the raw sum")
     train_parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across all frames in the candidate pool before DTW medoid filtering, so a few high-variance dimensions don't dominate the frame distance. Only affects which medoids are picked -- the HMM is still built from the unscaled embeddings")
+    train_parser.add_argument("--dtw-max-candidates", type=int, default=DTW_MAX_CANDIDATES, help=f"cluster at most this many candidates (a uniform random sample, seeded by --dtw-seed) in the DTW medoid filter -- its distance table and medoid search are quadratic in the pool size (~80 GB and days at 100k candidates). With --variance shared/cluster, the rest join their DTW-nearest medoid's cluster. Default {DTW_MAX_CANDIDATES}; 0 disables the cap")
+    train_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- n_match_states is the cap on piecewise segments used to compress each candidate (see top_k_switchpoints()/make_hmm()), so raising this floor forces the sweep to only consider models rich enough to represent motifs with more turns/segments than the default floor allows. Useful with --all-medoids: count_params()'s BIC penalty scales with n_sub_models * n_match_states, so a large n_sub_models pool can make BIC floor n_match_states at the sweep's minimum regardless of true motif complexity -- raising this floor is how to override that.")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
@@ -1535,6 +1543,8 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_candidates_parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance for medoid filtering: 'path' divides by warp-path length (default; rewards long warp paths over cheap cells and hides duration differences), 'length' divides by n + m (fixed per pair), 'none' keeps the raw sum")
     train_candidates_parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across all frames in the candidate pool before DTW medoid filtering, so a few high-variance dimensions don't dominate the frame distance. Only affects which medoids are picked -- the HMM is still built from the unscaled embeddings")
+    train_candidates_parser.add_argument("--dtw-max-candidates", type=int, default=DTW_MAX_CANDIDATES, help=f"cluster at most this many candidates (a uniform random sample, seeded by --dtw-seed) in the DTW medoid filter -- its distance table and medoid search are quadratic in the pool size (~80 GB and days at 100k candidates). With --variance shared/cluster, the rest join their DTW-nearest medoid's cluster. Default {DTW_MAX_CANDIDATES}; 0 disables the cap")
+    train_candidates_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_candidates_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- see train's --min-match-states for why this matters especially with --all-medoids")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")

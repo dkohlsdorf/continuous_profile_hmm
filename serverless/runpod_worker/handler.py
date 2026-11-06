@@ -132,6 +132,11 @@ Extend mode:
                                     # own CLI default ("path") -- "length"
                                     # divides the DTW cost by n + m, "none"
                                     # keeps the raw sum.
+        "dtw_max_candidates": 7500, # optional, default: train-candidates'
+                                    # own CLI default (7500) -- the DTW
+                                    # medoid filter clusters a random sample
+                                    # of at most this many candidates (it is
+                                    # quadratic in memory/time); 0 = no cap.
         "dtw_zscore": False,        # optional, default False -- True
                                     # z-scores each embedding dimension
                                     # across the pool before DTW filtering.
@@ -997,7 +1002,7 @@ SUBMODEL_CONSTRUCTION_MODES = {
 
 def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
                           dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None,
-                          dtw_norm=None, dtw_zscore=False, variance='medoid'):
+                          dtw_norm=None, dtw_zscore=False, variance='medoid', dtw_max_candidates=None):
     """
     motif_discovery.py train-candidates -- fit a new model directly from a
     candidates.pkl. all_medoids defaults on here (unlike train-candidates'
@@ -1046,6 +1051,8 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         cmd += ['--dtw-norm', dtw_norm]
     if dtw_zscore:
         cmd.append('--dtw-zscore')
+    if dtw_max_candidates is not None:
+        cmd += ['--dtw-max-candidates', str(dtw_max_candidates)]
     if variance != 'medoid':
         cmd += ['--variance', variance]
     _stream_subprocess(cmd, 'train-candidates')
@@ -1346,6 +1353,8 @@ def handle_extend(job_input):
     min_match_states = int(min_match_states) if min_match_states is not None else None
     dtw_norm = job_input.get('dtw_norm')
     dtw_zscore = bool(job_input.get('dtw_zscore', False))
+    dtw_max_candidates = job_input.get('dtw_max_candidates')
+    dtw_max_candidates = int(dtw_max_candidates) if dtw_max_candidates is not None else None
     submodel_construction = job_input.get('submodel_construction', 'medoid')
     if submodel_construction not in SUBMODEL_CONSTRUCTION_MODES:
         return {"error": f"submodel_construction must be one of {sorted(SUBMODEL_CONSTRUCTION_MODES)}, "
@@ -1521,7 +1530,8 @@ def handle_extend(job_input):
                 run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
                                       dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
                                       min_match_states=min_match_states, dtw_norm=dtw_norm,
-                                      dtw_zscore=dtw_zscore, variance=variance)
+                                      dtw_zscore=dtw_zscore, variance=variance,
+                                      dtw_max_candidates=dtw_max_candidates)
 
                 model_local = os.path.join(train_output, EXTEND_MODEL_NAME)
                 metadata_local = os.path.join(train_output, EXTEND_TRAINING_METADATA_NAME)
