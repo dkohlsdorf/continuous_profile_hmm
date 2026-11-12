@@ -65,6 +65,9 @@ def load_filtered_waveform(filename):
 
 
 def process(waveform, model, processor):
+    if model.kind == 'gemma':
+        yield from process_gemma(waveform, model)
+        return
     window_size_sample = CONFIG['window_size_samples'] // CONFIG['step_denominator']
     window_size = CONFIG['window_size_samples']
     with torch.no_grad():
@@ -90,6 +93,27 @@ def process(waveform, model, processor):
                 input_mask=input_mask
             )
             yield result
+
+
+def process_gemma(waveform, model, batch_size=64):
+    """
+    process() for WDPGemmaEmbModel: same windows/hop, run in batches, the
+    trailing short windows zero-padded to a full window. Yields one result
+    per window shaped like the Whisper model's (embeddings (1, D),
+    classifications (1, 1, n_classes)), so callers don't care which model ran.
+    """
+    hop = CONFIG['window_size_samples'] // CONFIG['step_denominator']
+    win = model.win
+    total_len = waveform.shape[1]
+    with torch.no_grad():
+        for b in range(0, total_len, hop * batch_size):
+            windows = []
+            for i in range(b, min(b + hop * batch_size, total_len), hop):
+                x = waveform[0, i:i + win]
+                windows.append(torch.nn.functional.pad(x, (0, win - x.shape[0])))
+            out = model(torch.stack(windows))
+            for e, c in zip(out['embeddings'], out['classifications']):
+                yield {'embeddings': e[None], 'classifications': c[None, None]}
 
 
 LABEL_MAP = {
