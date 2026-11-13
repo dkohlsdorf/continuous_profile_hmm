@@ -29,7 +29,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance: 'path' divides by warp-path length (default), 'length' by n + m, 'none' keeps the raw sum, used by --motif-mode-filtered")
     parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across the candidate pool before DTW, used by --motif-mode-filtered")
     parser.add_argument("--variance", choices=VARIANCE_MODES, default="medoid", help="how sub-model emissions are estimated (see make_hmm()): 'medoid' (default) from each medoid alone; 'shared'/'cluster' also use the other members of each medoid's DTW cluster and need --motif-mode-filtered (see motif_discovery.py's --variance)")
-    parser.add_argument("--max-members", type=int, default=5, help="--variance cluster only: at most this many cluster members per sub-model, nearest to the medoid first")
+    parser.add_argument("--max-members", type=int, default=None, help="--variance shared/cluster: at most this many cluster members per sub-model, nearest to the medoid first (default 5 for cluster, 50 for shared)")
     parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state towards its medoid's mean and the shared variance")
     parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
     parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
@@ -97,6 +97,7 @@ if __name__ == "__main__":
         )
         if pooled:
             candidates, members = candidates
+            members, args.max_members = cap_members(members, args.variance, args.max_members)
             construction = dict(members=members, variance=args.variance,
                                 max_members=args.max_members, shrinkage=args.shrinkage)
         print(f"DTW medoid filter: {n_before} candidates -> {len(candidates)} medoids "

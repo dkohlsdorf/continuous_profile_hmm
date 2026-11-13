@@ -136,7 +136,7 @@ from lib_phmm.config import CONFIG, EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL
 from lib_phmm.model import load_embedding_model
 from lib_phmm.signals import load_filtered_waveform, process, classify, class_probabilities, LABEL_MAP
 from lib_phmm import viterbi_smoothing
-from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid, VARIANCE_MODES
+from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid, cap_members, VARIANCE_MODES
 from lib_phmm.metrics import build_msa_from_paths, compute_all_metrics, metrics_to_dataframe
 import lib_phmm.profile_hmm as phmm
 
@@ -145,6 +145,9 @@ from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 MAX_MATCH  = 5
 MAX_STATES = 32
 MIN_STATES = 3
+# Cap on the DTW medoid filter's pool -- see --dtw-max-candidates. Around
+# the ~7k-candidate pools it has been run on directly (~17 min locally).
+DTW_MAX_CANDIDATES = 7500
 
 
 def wav_num_samples(wav_path):
@@ -354,7 +357,7 @@ def sweep(candidates, max_match=MAX_MATCH, min_match_states=MIN_STATES, flank_dw
     """
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
-    nested_results = Parallel(n_jobs=-1, backend="loky", verbose=10)(
+    nested_results = Parallel(n_jobs=min(MAX_STATES - min_match_states, os.cpu_count()), backend="loky", verbose=10)(
         delayed(sweep_one_state_count)(n_match_states, candidates, max_match, D, n_frames_total,
                                         flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
                                         require_full_match=require_full_match, **(construction or {}))
@@ -382,7 +385,7 @@ def sweep_all_medoids(candidates, min_match_states=MIN_STATES, flank_dwell_frame
     """
     D = candidates[0][0].shape[1]
     n_frames_total = sum(len(embedding) for embedding, _, _ in candidates)
-    return Parallel(n_jobs=-1, backend="loky", verbose=10)(
+    return Parallel(n_jobs=min(MAX_STATES - min_match_states, os.cpu_count()), backend="loky", verbose=10)(
         delayed(score_all_as_submodels)(n_match_states, candidates, D, n_frames_total,
                                          flank_dwell_frames=flank_dwell_frames, flank_alpha=flank_alpha,
                                          require_full_match=require_full_match, **(construction or {}))
@@ -722,6 +725,7 @@ def fit_model_from_candidates(candidates, args):
 
     Returns (hmm, n_states, n_models, best, flank_dwell_frames, n_filtered).
     Reads dtw_warping_band/dtw_epochs/dtw_restarts/dtw_density_tolerance/dtw_norm/dtw_zscore/
+    dtw_max_candidates/dtw_seed/
     all_medoids/max_match/min_match_states/flank_dwell_frames/flank_alpha/
     require_full_match/variance/max_members/shrinkage off of args --
     train_parser and train_candidates_parser both define all of these with
@@ -754,12 +758,17 @@ def fit_model_from_candidates(candidates, args):
         zscore=args.dtw_zscore,
         return_members=pooled,
         return_ids=True,
+        max_candidates=args.dtw_max_candidates or None,
+        seed=args.dtw_seed,
     )
     construction = None
     medoid_ids = filtered[-1]
     if pooled:
         filtered, members = filtered[0], filtered[1]
         sizes = np.array([1 + len(m) for m in members])
+        # only the max_members nearest are ever read -- don't ship the whole
+        # candidate pool to every sweep worker
+        members, args.max_members = cap_members(members, args.variance, args.max_members)
         construction = dict(members=members, variance=args.variance,
                             max_members=args.max_members, shrinkage=args.shrinkage)
         print(f"sub-model construction: variance={args.variance} from all cluster members "
@@ -1281,6 +1290,11 @@ def run_embed(args):
     print("==========================================")
 
 
+# Per-part cap for extend-candidates' l2 wavs: 2 GiB keeps well under the
+# 4 GiB RIFF limit and under signed-32-bit readers too.
+L2_WAV_MAX_BYTES = 2 ** 31
+
+
 def run_extend_candidates(args):
     """
     `extend-candidates` -- grow a baked candidates.pkl (e.g. train's
@@ -1324,10 +1338,27 @@ def run_extend_candidates(args):
     # pool) only for those long enough to become a candidate. A file with no
     # region at all still gets one empty row so it shows up with 0s.
     sources = [(i, "baked", None, None) for i in range(len(baked))]
-    audio_chunks = []
+    # Region audio is streamed straight into the l2 wav (16-bit PCM, as
+    # torchaudio.save wrote it before) -- collecting every clip and
+    # torch.cat-ing them at the end OOM-killed a ~99k-region run.
+    output_path = Path(args.output_candidates_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # RIFF/WAV sizes are 32-bit (stdlib wave raises struct.error past
+    # 4 GiB), so the regions are split over l2_<dt>_<part>.csv/.wav pairs,
+    # each a self-contained starts,stops-into-one-wav input for train.
+    dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    wav_out = None
     csv_rows = []
     cursor = 0
+    part = 0
+    n_regions_written = 0
     combined_sample_rate = None
+
+    def close_part():
+        wav_out.close()
+        csv_part = output_path.parent / f"l2_{dt}_{part:03d}.csv"
+        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_part, index=False)
+        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_part.name} / {csv_part.stem}.wav")
     for path in embeddings_files:
         embeddings, classifications, step_samples, sample_rate, class_probs = load_embeddings_cache(path)
         if args.viterbi_smoothing:
@@ -1336,8 +1367,12 @@ def run_extend_candidates(args):
                                  f"re-embed it to use --viterbi-smoothing")
             classifications = viterbi_smoothing.smooth(class_probs)
         spans = find_non_noise_spans(classifications, min_size=args.min_region_frames)
-        extracted = [(embeddings[start:stop], embeddings[start:stop], classifications[start:stop])
-                     for start, stop in spans]
+        # .copy(): a bare slice is a view that keeps this file's whole
+        # embeddings/classifications arrays alive for the rest of the run.
+        extracted = []
+        for start, stop in spans:
+            segment = embeddings[start:stop].copy()
+            extracted.append((segment, segment, classifications[start:stop].copy()))
         print(f"  {path.parent.name}: {len(extracted)} non-NOISE region(s) extracted from {len(embeddings)} windows")
         new_candidates.extend(extracted)
         used = {span: len(baked) + len(new_candidates) - len(extracted) + k for k, span in enumerate(spans)}
@@ -1361,16 +1396,26 @@ def run_extend_candidates(args):
                 sample_stop = min(stop * step_samples, n_samples)
                 if sample_stop <= sample_start:
                     continue
-                clip = waveform[:, sample_start:sample_stop]
-                audio_chunks.append(clip)
-                csv_rows.append((cursor, cursor + clip.shape[1]))
-                cursor += clip.shape[1]
+                clip = waveform[0, sample_start:sample_stop]
+                pcm = (clip.clamp(-1.0, 1.0) * 32767).to(torch.int16).numpy()
+                if wav_out is not None and (cursor + len(pcm)) * 2 > L2_WAV_MAX_BYTES:
+                    close_part()
+                    part += 1
+                    wav_out, csv_rows, cursor = None, [], 0
+                if wav_out is None:
+                    wav_out = wave.open(str(output_path.parent / f"l2_{dt}_{part:03d}.wav"), 'wb')
+                    wav_out.setnchannels(1)
+                    wav_out.setsampwidth(2)
+                    wav_out.setframerate(combined_sample_rate)
+                wav_out.writeframes(pcm.tobytes())
+                csv_rows.append((cursor, cursor + len(pcm)))
+                cursor += len(pcm)
+                n_regions_written += 1
+            del waveform
 
     combined = baked + new_candidates
     print(f"Combined candidate pool: {len(baked)} baked + {len(new_candidates)} new = {len(combined)}")
 
-    output_path = Path(args.output_candidates_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
         pkl.dump(combined, f)
     print(f"Saved combined candidates to {output_path}")
@@ -1380,15 +1425,10 @@ def run_extend_candidates(args):
         .to_csv(sources_path, index=False)
     print(f"Saved per-candidate source recording to {sources_path}")
 
-    if audio_chunks:
-        dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        csv_path = output_path.parent / f"l2_{dt}.csv"
-        wav_path = output_path.parent / f"l2_{dt}.wav"
-        pd.DataFrame(csv_rows, columns=["starts", "stops"]).to_csv(csv_path, index=False)
-        concatenated = torch.cat(audio_chunks, dim=1)
-        torchaudio.save(str(wav_path), concatenated, combined_sample_rate)
-        print(f"Wrote {len(csv_rows)} new-candidate region(s) to {csv_path} / {wav_path} "
-              f"(same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
+    if wav_out is not None:
+        close_part()
+        print(f"Wrote {n_regions_written} new-candidate region(s) over {part + 1} l2_{dt}_<part>.csv/.wav "
+              f"pair(s) (same starts,stops-into-one-wav format train's csv_path/wav_path expects)")
     else:
         print("No audio.wav found next to any embeddings.pkl -- skipping l2_<timestamp>.csv/.wav output")
 
@@ -1467,7 +1507,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Cost is roughly O(max_match * filtered_candidates^2) per n_match_states value, so raising this much scales the whole sweep, not just the sub-model cap. Ignored if --all-medoids is set.")
     train_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally (n_sub_models = n_candidates_filtered). Only n_match_states is still BIC-picked. Much cheaper than raising --max-match to cover the whole filtered pool, since it skips the O(max_match * candidates^2) search entirely.")
     train_parser.add_argument("--variance", choices=VARIANCE_MODES, default="medoid", help="how sub-model emissions are estimated (see make_hmm()): 'medoid' (default) from each DTW-filter medoid alone; 'shared' keeps the medoid's states and means but gives every state of every sub-model one diagonal variance pooled from all leaf-cluster members aligned to their medoid; 'cluster' estimates each state's mean and variance from its medoid plus its --max-members nearest cluster members, shrunk towards the medoid mean / shared variance by --shrinkage pseudo-frames. Both pooled modes also pool the members' alignments into each sub-model's dwell/entry transitions.")
-    train_parser.add_argument("--max-members", type=int, default=5, help="--variance cluster only: at most this many cluster members (nearest to the medoid by DTW first) per sub-model, so large clusters can't pull in other clusters' examples (default 5: on a held-out test this kept misassignments to the largest clusters at the medoid model's rate while raising own-cluster decoding; 20 gains more but roughly doubles that pull)")
+    train_parser.add_argument("--max-members", type=int, default=None, help="--variance shared/cluster: at most this many cluster members (nearest to the medoid by DTW first) per sub-model. Default 5 for cluster, so large clusters can't pull in other clusters' examples (on a held-out test this kept misassignments to the largest clusters at the medoid model's rate while raising own-cluster decoding; 20 gains more but roughly doubles that pull); default 50 for shared, enough frames for the one pooled variance without shipping the whole candidate pool to every sweep worker")
     train_parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state's mean towards its medoid's and its variance towards the shared variance, so states with few member frames stay close to the medoid (default 10)")
     train_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
@@ -1475,6 +1515,8 @@ if __name__ == "__main__":
     train_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance for medoid filtering: 'path' divides by warp-path length (default; rewards long warp paths over cheap cells and hides duration differences), 'length' divides by n + m (fixed per pair), 'none' keeps the raw sum")
     train_parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across all frames in the candidate pool before DTW medoid filtering, so a few high-variance dimensions don't dominate the frame distance. Only affects which medoids are picked -- the HMM is still built from the unscaled embeddings")
+    train_parser.add_argument("--dtw-max-candidates", type=int, default=DTW_MAX_CANDIDATES, help=f"cluster at most this many candidates (a uniform random sample, seeded by --dtw-seed) in the DTW medoid filter -- its distance table and medoid search are quadratic in the pool size (~80 GB and days at 100k candidates). With --variance shared/cluster, the rest join their DTW-nearest medoid's cluster. Default {DTW_MAX_CANDIDATES}; 0 disables the cap")
+    train_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- n_match_states is the cap on piecewise segments used to compress each candidate (see top_k_switchpoints()/make_hmm()), so raising this floor forces the sweep to only consider models rich enough to represent motifs with more turns/segments than the default floor allows. Useful with --all-medoids: count_params()'s BIC penalty scales with n_sub_models * n_match_states, so a large n_sub_models pool can make BIC floor n_match_states at the sweep's minimum regardless of true motif complexity -- raising this floor is how to override that.")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING_MODEL, help=f"embedding/classifier model to embed audio with: {{{', '.join(EMBEDDING_MODELS)}}} (default {DEFAULT_EMBEDDING_MODEL}). Recorded in training_metadata.json so find embeds search audio with the same model. candidates.pkl in output_path is reused regardless -- delete it after switching models.")
@@ -1521,7 +1563,7 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--max-match", type=int, default=MAX_MATCH, help=f"max sub-models the greedy sweep may try (BIC picks how many to keep) -- default {MAX_MATCH}. Ignored if --all-medoids is set.")
     train_candidates_parser.add_argument("--all-medoids", action="store_true", help="skip greedy exemplar selection -- every DTW-filtered candidate becomes a sub-model unconditionally. Only n_match_states is still BIC-picked.")
     train_candidates_parser.add_argument("--variance", choices=VARIANCE_MODES, default="medoid", help="how sub-model emissions are estimated (see make_hmm()): 'medoid' (default) from each DTW-filter medoid alone; 'shared' keeps the medoid's states and means but gives every state of every sub-model one diagonal variance pooled from all leaf-cluster members aligned to their medoid; 'cluster' estimates each state's mean and variance from its medoid plus its --max-members nearest cluster members, shrunk towards the medoid mean / shared variance by --shrinkage pseudo-frames. Both pooled modes also pool the members' alignments into each sub-model's dwell/entry transitions.")
-    train_candidates_parser.add_argument("--max-members", type=int, default=5, help="--variance cluster only: at most this many cluster members (nearest to the medoid by DTW first) per sub-model, so large clusters can't pull in other clusters' examples (default 5: on a held-out test this kept misassignments to the largest clusters at the medoid model's rate while raising own-cluster decoding; 20 gains more but roughly doubles that pull)")
+    train_candidates_parser.add_argument("--max-members", type=int, default=None, help="--variance shared/cluster: at most this many cluster members (nearest to the medoid by DTW first) per sub-model. Default 5 for cluster, so large clusters can't pull in other clusters' examples (on a held-out test this kept misassignments to the largest clusters at the medoid model's rate while raising own-cluster decoding; 20 gains more but roughly doubles that pull); default 50 for shared, enough frames for the one pooled variance without shipping the whole candidate pool to every sweep worker")
     train_candidates_parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state's mean towards its medoid's and its variance towards the shared variance, so states with few member frames stay close to the medoid (default 10)")
     train_candidates_parser.add_argument("--dtw-warping-band", type=int, default=5, help="Sakoe-Chiba warping band for DTW distance")
     train_candidates_parser.add_argument("--dtw-epochs", type=int, default=20, help="max k-medoids refinement epochs per split")
@@ -1529,6 +1571,8 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--dtw-density-tolerance", type=float, default=0.05, help="fractional slack below the parent's density a child may still have and keep splitting (0.05 = up to 5%% less dense than its parent still counts as an improvement) -- higher keeps more, finer medoids; 0 requires a child to be strictly denser than its parent")
     train_candidates_parser.add_argument("--dtw-norm", choices=["path", "length", "none"], default="path", help="how the summed DTW cost becomes a distance for medoid filtering: 'path' divides by warp-path length (default; rewards long warp paths over cheap cells and hides duration differences), 'length' divides by n + m (fixed per pair), 'none' keeps the raw sum")
     train_candidates_parser.add_argument("--dtw-zscore", action="store_true", help="z-score each embedding dimension across all frames in the candidate pool before DTW medoid filtering, so a few high-variance dimensions don't dominate the frame distance. Only affects which medoids are picked -- the HMM is still built from the unscaled embeddings")
+    train_candidates_parser.add_argument("--dtw-max-candidates", type=int, default=DTW_MAX_CANDIDATES, help=f"cluster at most this many candidates (a uniform random sample, seeded by --dtw-seed) in the DTW medoid filter -- its distance table and medoid search are quadratic in the pool size (~80 GB and days at 100k candidates). With --variance shared/cluster, the rest join their DTW-nearest medoid's cluster. Default {DTW_MAX_CANDIDATES}; 0 disables the cap")
+    train_candidates_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_candidates_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- see train's --min-match-states for why this matters especially with --all-medoids")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
     train_candidates_parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING_MODEL, help=f"embedding/classifier model to embed audio with: {{{', '.join(EMBEDDING_MODELS)}}} (default {DEFAULT_EMBEDDING_MODEL}). Has to be the model candidates_path was embedded with (it isn't recorded in candidates.pkl) -- written into training_metadata.json so find embeds search audio the same way.")

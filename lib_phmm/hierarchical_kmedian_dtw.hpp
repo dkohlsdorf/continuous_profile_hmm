@@ -34,39 +34,50 @@ inline double dtw(Mat &x, Mat &y, int warping_band, int norm = DTW_NORM_PATH) {
   int n = x.size();
   int m = y.size();
 
-  Mat dp = Mat(n + 1, Vec(m + 1, INFINITY));
-  vector<vector<int>> plen(n + 1, vector<int>(m + 1, 0));
-  dp[0][0] = 0.0;
+  // Two rolling rows instead of full (n+1) x (m+1) matrices: the DP only
+  // reads row i-1 and row i, and a full matrix for a ~38k-frame candidate
+  // pair is ~17 GB.
+  Vec prev(m + 1, INFINITY), cur(m + 1, INFINITY);
+  vector<int> prev_len(m + 1, 0), cur_len(m + 1, 0);
+  prev[0] = 0.0;
 
   int w = max(warping_band, abs(n - m));
 
   for(int i = 1; i <= n; i++) {
     int j_start = max(1, i - w);
     int j_end = min(m, i + w);
+    // Reset the cells this row reads (j_start - 1 .. j_end) plus j_end + 1,
+    // which the next row reads as `up` but this row doesn't write -- they
+    // still hold row i - 2's values otherwise.
+    for(int j = j_start - 1; j <= min(m, j_end + 1); j++) cur[j] = INFINITY;
     for(int j = j_start; j <= j_end; j++) {
-      double up   = dp[i - 1][j];
-      double diag = dp[i - 1][j - 1];
-      double left = dp[i][j - 1];
+      double up   = prev[j];
+      double diag = prev[j - 1];
+      double left = cur[j - 1];
 
       // same tie-break order as the old min3(up, diag, left)
       double best = up;
-      int best_len = plen[i - 1][j];
-      if(diag < best) { best = diag; best_len = plen[i - 1][j - 1]; }
-      if(left < best) { best = left; best_len = plen[i][j - 1]; }
+      int best_len = prev_len[j];
+      if(diag < best) { best = diag; best_len = prev_len[j - 1]; }
+      if(left < best) { best = left; best_len = cur_len[j - 1]; }
 
-      dp[i][j] = best + euc(x[i - 1], y[j - 1]);
-      plen[i][j] = best_len + 1;
+      cur[j] = best + euc(x[i - 1], y[j - 1]);
+      cur_len[j] = best_len + 1;
     }
+    swap(prev, cur);
+    swap(prev_len, cur_len);
   }
+  double total = prev[m];
+  int path_len = prev_len[m];
 
   // DTW_NORM_PATH makes distances comparable across candidate regions of
   // different durations, but the DP minimizes the summed cost, not this
   // mean, and a longer path over cheap cells lowers the mean.
   // DTW_NORM_LENGTH divides by n + m instead, which is fixed per pair, so
   // the DP's optimum stays the optimum of the returned distance.
-  if(norm == DTW_NORM_NONE) return dp[n][m];
-  if(norm == DTW_NORM_LENGTH) return dp[n][m] / (n + m);
-  return dp[n][m] / plen[n][m];
+  if(norm == DTW_NORM_NONE) return total;
+  if(norm == DTW_NORM_LENGTH) return total / (n + m);
+  return total / path_len;
 }
 
 inline int instance_pair_hash(int i, int j, int n_instances) {

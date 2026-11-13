@@ -79,24 +79,6 @@ COPY serverless/runpod_worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir runpod google-api-python-client google-auth
 
-# Project source. lib_phmm's checked-in profile_hmm.cpython-*.so /
-# hierarchical_kmedian_dtw.cpython-*.so are macOS arm64 builds (see
-# .dockerignore) and won't load here -- rebuilt below for this container's
-# Linux/Python instead.
-COPY motif_discovery.py .
-COPY annotate.py .
-# Imported directly by handler.py's build_and_upload_pvl_db() (not run as
-# its own subprocess, unlike motif_discovery.py/annotate.py) to combine a
-# run's annotated_motif_hits.csv files into pvl.db/pvl_annotated_audio.csv
-# (and hotcoded.out/hotcoding_meta.json).
-COPY pvl_feature_extractor.py .
-COPY lib_phmm/ ./lib_phmm/
-
-RUN cd lib_phmm && pip install --no-cache-dir -e . --no-build-isolation && cd ..
-
-RUN python -c "import lib_phmm.profile_hmm as phmm; print('profile_hmm loaded')" && \
-    python -c "import lib_phmm.hierarchical_kmedian_dtw as hkd; print('hierarchical_kmedian_dtw loaded')"
-
 # Pre-download the Whisper-small base weights lib_phmm/model.py's
 # lora_encoder() wraps, so a cold job doesn't stall on the HF Hub.
 RUN python -c "from transformers import WhisperModel, WhisperProcessor; \
@@ -150,6 +132,27 @@ COPY serverless/runpod_worker/assets/training_metadata.json ./motif/l2/training_
 # embedding model, which find reads to embed search audio the same way.
 COPY serverless/runpod_worker/assets/l2_gemma_noiseaug/ ./motif/l2_gemma_noiseaug/
 COPY serverless/runpod_worker/assets/l2_gemma_noiseaug_hr/ ./motif/l2_gemma_noiseaug_hr/
+
+# Code last: everything above is large and rarely changes, so a code-only
+# change rebuilds/pushes only these small layers instead of re-uploading
+# Whisper + model + assets (>1GB).
+# lib_phmm's checked-in profile_hmm.cpython-*.so /
+# hierarchical_kmedian_dtw.cpython-*.so are macOS arm64 builds (see
+# .dockerignore) and won't load here -- rebuilt below for this container's
+# Linux/Python instead.
+COPY motif_discovery.py .
+COPY annotate.py .
+# Imported directly by handler.py's build_and_upload_pvl_db() (not run as
+# its own subprocess, unlike motif_discovery.py/annotate.py) to combine a
+# run's annotated_motif_hits.csv files into pvl.db/pvl_annotated_audio.csv
+# (and hotcoded.out/hotcoding_meta.json).
+COPY pvl_feature_extractor.py .
+COPY lib_phmm/ ./lib_phmm/
+
+RUN cd lib_phmm && pip install --no-cache-dir -e . --no-build-isolation && cd ..
+
+RUN python -c "import lib_phmm.profile_hmm as phmm; print('profile_hmm loaded')" && \
+    python -c "import lib_phmm.hierarchical_kmedian_dtw as hkd; print('hierarchical_kmedian_dtw loaded')"
 
 COPY serverless/runpod_worker/handler.py .
 

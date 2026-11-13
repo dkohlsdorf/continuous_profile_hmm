@@ -160,6 +160,22 @@ def estimate_transitions(alignments, n_match_states,
 
 VARIANCE_MODES = ('medoid', 'shared', 'cluster')
 VAR_FLOOR = 0.1   # same floor compress() applies
+# members pooled per sub-model (nearest to the medoid first) when max_members is None:
+# 'cluster' keeps few so large clusters can't pull in other clusters' examples;
+# 'shared' only needs enough frames for one pooled variance vector
+DEFAULT_MAX_MEMBERS = {'cluster': 5, 'shared': 50}
+
+
+def cap_members(members, variance, max_members=None):
+    """
+    Resolve max_members (None -> DEFAULT_MAX_MEMBERS[variance]) and cut each
+    cluster to its nearest max_members -- the only ones _pool_members()
+    reads, so callers can drop the rest before shipping members to sweep
+    workers. Returns (members, max_members).
+    """
+    if max_members is None:
+        max_members = DEFAULT_MAX_MEMBERS[variance]
+    return [m[:max_members] for m in members], max_members
 
 
 def _diag_gauss_ll(frames, means, variances):
@@ -207,8 +223,7 @@ def _pool_members(compressed, members, variance, max_members, shrinkage):
         mu, var = np.asarray(mu), np.asarray(var)
         frames_by_state = [[np.asarray(sequence)[a == k]] for k in range(len(mu))]   # medoid's own frames
         extra_paths = []
-        if variance == 'cluster' and max_members is not None:
-            cluster = cluster[:max_members]                                       # nearest to the medoid first
+        cluster = cluster[:max_members]                                           # nearest to the medoid first
         for embedding, _, classifications in cluster:
             frames = np.asarray(embedding)
             states = align_to_states(frames, mu, var)
@@ -246,7 +261,7 @@ def _pool_members(compressed, members, variance, max_members, shrinkage):
 
 def make_hmm(sequences, classifications_list, max_switchpoints=12,
              flank_dwell_frames=None, flank_alpha=500.0,
-             members=None, variance='medoid', max_members=5, shrinkage=10.0):
+             members=None, variance='medoid', max_members=None, shrinkage=10.0):
     """
     Build one ProfileHMM with a shared flank (N/B/E/C/J) and one
     match-state sub-HMM per input sequence -- pdf[n] is sequence n's own
@@ -267,12 +282,14 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12,
                 states -- same width everywhere, so cluster size can't make
                 one sub-HMM broader than another.
       'cluster' each state's mean and variance from its medoid's frames plus
-                its members' aligned frames (the `max_members` nearest),
+                its members' aligned frames,
                 shrunk towards the medoid's mean and the shared variance by
                 `shrinkage` pseudo-frames so small clusters stay close to
                 the medoid.
     Both pooled modes need `members` (per sequence, the other candidates
-    of its cluster as (embedding, full, classifications), nearest first),
+    of its cluster as (embedding, full, classifications), nearest first)
+    and use only the `max_members` nearest of each (None ->
+    DEFAULT_MAX_MEMBERS[variance]),
     align each member once to its medoid's states (align_to_states(), no
     re-estimation loop), and also pool the members' alignments into that
     sub-HMM's dwell (mm) and entry (b_to_hmm) estimates and the shared
@@ -293,6 +310,7 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12,
 
     extra_paths = [[] for _ in compressed]
     if variance != 'medoid':
+        members, max_members = cap_members(members, variance, max_members)
         emissions, extra_paths = _pool_members(compressed, members, variance, max_members, shrinkage)
         compressed = [(mu, std, path, a, sequence) for (mu, std), (_, _, path, a, sequence) in zip(emissions, compressed)]
 
@@ -329,19 +347,22 @@ def make_hmm(sequences, classifications_list, max_switchpoints=12,
     return hmm, n_match_states
 
 
-def _zscore_pool(candidates, eps=1e-8):
-    frames = np.concatenate([np.asarray(region) for region, _, _ in candidates], axis=0)
-    mean, std = frames.mean(axis=0), frames.std(axis=0) + eps
-    return [((np.asarray(region) - mean) / std, full, cls) for region, full, cls in candidates]
-
-
-def _to_dtw_dataset(candidates):
-    return [[[float(v) for v in frame] for frame in region_embeddings]
-            for region_embeddings, _, _ in candidates]
+def _zscore_stats(candidates, eps=1e-8):
+    # streamed sums: concatenating every frame of a ~100k-candidate pool
+    # costs several GB on its own
+    n, total, total_sq = 0, 0.0, 0.0
+    for region, _, _ in candidates:
+        region = np.asarray(region, dtype=np.float64)
+        n += len(region)
+        total = total + region.sum(axis=0)
+        total_sq = total_sq + (region ** 2).sum(axis=0)
+    mean = total / n
+    return mean, np.sqrt(np.maximum(total_sq / n - mean ** 2, 0.0)) + eps
 
 
 def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=10, tolerance=0.05,
-                                norm="path", zscore=False, return_members=False, return_ids=False):
+                                norm="path", zscore=False, return_members=False, return_ids=False,
+                                max_candidates=None, seed=0, assign_batch=2000):
     """
     Cluster candidate motif regions by DTW distance (divisive hierarchical
     k-medoids -- see lib_phmm/hierarchical_kmedian_dtw.hpp) and keep only
@@ -377,30 +398,64 @@ def filter_candidates_by_medoid(candidates, warping_band=5, epochs=20, restarts=
     each of those joins its nearest medoid's cluster.
 
     return_ids=True also returns the medoids' indices into candidates, last.
-    """
-    dataset = _to_dtw_dataset(_zscore_pool(candidates) if zscore else candidates)
-    dm = hkd.DistanceManager(dataset, warping_band, norm)
-    if not return_members:
-        medoid_ids = dm.kmedoids([], epochs, restarts, tolerance)
-        medoids = [candidates[i] for i in medoid_ids]
-        return (medoids, list(medoid_ids)) if return_ids else medoids
 
+    max_candidates caps how many candidates the clustering itself sees: a
+    larger pool is clustered on a uniform random sample (seeded by seed) of
+    that size. The clustering keeps an N x N distance table and picks each
+    cluster's medoid from all its pairwise distances, so it is quadratic in
+    both memory and time -- ~80 GB and days at N ~ 100k. With
+    return_members, candidates outside the sample join their DTW-nearest
+    medoid's cluster (hkd.nearest, assign_batch at a time).
+    """
+    if zscore:
+        mean, std = _zscore_stats(candidates)
+        prep = lambda region: (np.asarray(region, dtype=np.float64) - mean) / std
+    else:
+        prep = lambda region: np.asarray(region, dtype=np.float64)
+
+    n = len(candidates)
+    if max_candidates is not None and n > max_candidates:
+        sample = np.sort(np.random.default_rng(seed).choice(n, max_candidates, replace=False)).tolist()
+        print(f"DTW medoid filter: clustering a random sample of {max_candidates} of {n} candidates "
+              f"(max_candidates={max_candidates}, seed={seed})")
+    else:
+        sample = list(range(n))
+    dm = hkd.DistanceManager([prep(candidates[i][0]) for i in sample], warping_band, norm)
+    if not return_members:
+        medoid_ids = [sample[i] for i in dm.kmedoids([], epochs, restarts, tolerance)]
+        medoids = [candidates[i] for i in medoid_ids]
+        return (medoids, medoid_ids) if return_ids else medoids
+
+    # local = index into sample (and dm); clusters hold (distance, global id)
     leaves = dm.kmedoids_leaves([], epochs, restarts, tolerance)
-    medoid_ids = sorted(leaves)
-    clusters = {m: [i for i in leaves[m] if i != m] for m in medoid_ids}
+    local_medoids = sorted(leaves)
+    clusters = {m: [(dm.distance(i, m), sample[i]) for i in leaves[m] if i != m] for m in local_medoids}
     covered = {i for leaf in leaves.values() for i in leaf}
-    for i in range(len(candidates)):
+    for i in range(len(sample)):
         if i not in covered:
-            clusters[min(medoid_ids, key=lambda m: dm.distance(i, m))].append(i)
-    members = [[candidates[i] for i in sorted(clusters[m], key=lambda i: dm.distance(i, m))]
-               for m in medoid_ids]
-    medoids = [candidates[m] for m in medoid_ids]
+            m = min(local_medoids, key=lambda m: dm.distance(i, m))
+            clusters[m].append((dm.distance(i, m), sample[i]))
+
+    rest = sorted(set(range(n)) - set(sample))
+    if rest:
+        medoid_seqs = [prep(candidates[sample[m]][0]) for m in local_medoids]
+        print(f"DTW medoid filter: assigning {len(rest)} out-of-sample candidates to "
+              f"their nearest of {len(local_medoids)} medoids")
+        for start in range(0, len(rest), assign_batch):
+            batch = rest[start:start + assign_batch]
+            nearest, dists = hkd.nearest([prep(candidates[i][0]) for i in batch], medoid_seqs, warping_band, norm)
+            for i, k, d in zip(batch, nearest, dists):
+                clusters[local_medoids[k]].append((d, i))
+
+    medoid_ids = [sample[m] for m in local_medoids]
+    members = [[candidates[i] for _, i in sorted(clusters[m])] for m in local_medoids]
+    medoids = [candidates[i] for i in medoid_ids]
     return (medoids, members, medoid_ids) if return_ids else (medoids, members)
 
 
 def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_total,
                            flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False,
-                           members=None, variance='medoid', max_members=5, shrinkage=10.0):
+                           members=None, variance='medoid', max_members=None, shrinkage=10.0):
     # members/variance/max_members/shrinkage: see make_hmm() -- members is
     # parallel to `embeddings` (each candidate's cluster)
     best_embeddings = []
@@ -461,7 +516,7 @@ def sweep_one_state_count(n_match_states, embeddings, max_match, dim, n_frames_t
 
 def score_all_as_submodels(n_match_states, embeddings, dim, n_frames_total,
                             flank_dwell_frames=None, flank_alpha=500.0, require_full_match=False,
-                            members=None, variance='medoid', max_members=5, shrinkage=10.0):
+                            members=None, variance='medoid', max_members=None, shrinkage=10.0):
     """
     Like sweep_one_state_count(), but skips the greedy exemplar
     selection entirely: every sequence in `embeddings` becomes its own
