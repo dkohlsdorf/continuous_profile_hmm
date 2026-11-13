@@ -54,7 +54,15 @@ Input:
                                         # charged once per hit, so raising it merges fragmented
                                         # hits (100 -> 6.6 bits, 1e4 -> 13.3, 1e6 -> 19.9 per hit).
                                         # See find's --gap-dwell-frames. Also applies in extend mode.
-            "repeat_prob": 0.999        # optional, default: find's own (0.999) -- see --repeat-prob.
+            "repeat_prob": 0.999,       # optional, default: find's own (0.999) -- see --repeat-prob.
+            "embedding_model": "whisper"  # optional, default "whisper" -- which embedding/classifier
+                                        # model embeds the audio: "whisper", "gemma_noiseaug" or
+                                        # "gemma_noiseaug_hr" (lib_phmm.config.EMBEDDING_MODELS).
+                                        # Selects the matching baked L2 model/candidates
+                                        # (BAKED_L2_DIRS) and keeps a separate embeddings cache
+                                        # and extend state folder per model, since embeddings
+                                        # from different models can't be mixed. Also applies in
+                                        # extend mode.
         }
     }
 
@@ -220,8 +228,11 @@ Embeddings cache:
     to sweep noise_var_scale / noise_components cheap after the first pass.
     The cache folder deliberately sits next to the timestamped result
     folders rather than inside one, so it survives across runs. Set
-    use_embeddings_cache=false to force a fresh decode (e.g. after changing
-    the embedding model itself, which the cache can't detect).
+    use_embeddings_cache=false to force a fresh decode (e.g. after retraining
+    an embedding model in place, which the cache can't detect). Each
+    embedding_model has its own entries (<stem>.<version>.<model>.pkl for
+    non-whisper models, see model_suffix()), so switching models never
+    picks up another model's embeddings.
 
     The packaged --noise-wav's own embeddings are cached the same way, as
     a single NOISE_EMBEDDINGS_CACHE_NAME entry in this same Drive folder
@@ -271,14 +282,34 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 import pvl_feature_extractor
+from lib_phmm.config import EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL
 
 MOTIF_DISCOVERY_SCRIPT = "/app/motif_discovery.py"
 ANNOTATE_SCRIPT = "/app/annotate.py"
 APP_DIR = "/app"
-MODEL_PATH = "/app/motif/l2/phmm_l2.pkl"
 NOISE_WAV_PATH = "/app/assets/naive_noise.wav"
-BAKED_CANDIDATES_PATH = "/app/motif/l2/candidates.pkl"
-TRAINING_METADATA_PATH = "/app/motif/l2/training_metadata.json"
+
+# One baked L2 model + candidates.pkl + training_metadata.json per embedding
+# model -- an HMM/candidate pool only makes sense in the embedding space it
+# was built in. Each dir holds phmm_l2.pkl, candidates.pkl and
+# training_metadata.json (which also records the embedding model, so find
+# picks it up from there).
+BAKED_L2_DIRS = {
+    "whisper": "/app/motif/l2",
+    "gemma_noiseaug": "/app/motif/l2_gemma_noiseaug",
+    "gemma_noiseaug_hr": "/app/motif/l2_gemma_noiseaug_hr",
+}
+assert set(BAKED_L2_DIRS) == set(EMBEDDING_MODELS)
+BAKED_MODEL_NAME = "phmm_l2.pkl"
+BAKED_CANDIDATES_NAME = "candidates.pkl"
+TRAINING_METADATA_NAME = "training_metadata.json"
+
+
+def model_suffix(embedding_model):
+    """Appended to embeddings-cache entry and extend-state folder names, so
+    each embedding model gets its own. Empty for whisper, keeping every
+    cache/state written before there was a choice valid."""
+    return "" if embedding_model == DEFAULT_EMBEDDING_MODEL else f".{embedding_model}"
 
 # Persistent (NOT per-run/timestamped) Drive folder holding one "extend" job
 # family's staged state -- candidates.pkl, then phmm_extended.pkl once
@@ -332,7 +363,9 @@ EMBEDDINGS_CACHE_VERSION_WITH_PROBS = "v3"
 # otherwise be re-embedded once per recording. Stashing it at this
 # container-local path after the first file and copying it back in for
 # every subsequent one keeps that decode to once per job.
-NOISE_EMBEDDINGS_CACHE_PATH = "/app/work/noise_embeddings.pkl"
+# Keyed by embedding model (see model_suffix()): a warm container may run
+# jobs with different models back to back.
+NOISE_EMBEDDINGS_CACHE_PATH = "/app/work/noise_embeddings{suffix}.pkl"
 
 # Drive-persisted counterpart of NOISE_EMBEDDINGS_CACHE_PATH -- lives in the
 # same motif_embeddings_cache folder find's own per-recording embeddings
@@ -344,7 +377,7 @@ NOISE_EMBEDDINGS_CACHE_PATH = "/app/work/noise_embeddings.pkl"
 # a bump makes the old Drive entry simply invisible rather than silently
 # reused.
 NOISE_EMBEDDINGS_CACHE_VERSION = "v2"  # v2: new packaged naive_noise.wav (k-means++ noise sample)
-NOISE_EMBEDDINGS_CACHE_NAME = f"noise_embeddings.{NOISE_EMBEDDINGS_CACHE_VERSION}.pkl"
+NOISE_EMBEDDINGS_CACHE_NAME = "noise_embeddings.{version}{suffix}.pkl"
 
 
 
@@ -638,16 +671,17 @@ def convert_to_mono_first_channel(input_path, output_path):
         raise RuntimeError(f"ffmpeg mono conversion failed for {input_path}:\n{result.stderr}")
 
 
-def run_find(wav_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
-             require_full_match=False, model_path=MODEL_PATH, gap_dwell_frames=None, repeat_prob=None):
+def run_find(wav_path, output_path, model_path, noise_components, noise_var_scale, hit_gap_seconds,
+             require_full_match=False, gap_dwell_frames=None, repeat_prob=None):
     """
     Run motif_discovery.py find for one wav file against a model + the
     packaged noise recording, streaming its output live. cwd=APP_DIR because
     CONFIG['checkpoint_path'] (lib_phmm/config.py) is a path relative to cwd,
     not to motif_discovery.py's location.
 
-    model_path defaults to the packaged L2 model; handle_extend() overrides
-    it with a downloaded phmm_extended.pkl once one exists.
+    model_path is the packaged L2 model for the job's embedding model, or
+    handle_extend()'s downloaded phmm_extended.pkl. find reads which
+    embedding model to embed with from the training_metadata.json next to it.
 
     require_full_match forwards to find's --require-full-match (see there
     and phmm.viterbi()'s docstring) -- disallows partial matches (entering
@@ -969,12 +1003,13 @@ def _stream_subprocess(cmd, step_name):
         raise RuntimeError(f"motif_discovery.py {step_name} failed with return code {process.returncode}")
 
 
-def run_embed(wav_path, output_path, resample_hz):
+def run_embed(wav_path, output_path, resample_hz, embedding_model):
     """motif_discovery.py embed for one file -- find's embedding step with no model needed yet."""
     _stream_subprocess([
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'embed',
         wav_path, output_path,
         '--resample-hz', str(resample_hz),
+        '--embedding-model', embedding_model,
         '--verbose',
     ], 'embed')
 
@@ -1000,7 +1035,7 @@ SUBMODEL_CONSTRUCTION_MODES = {
 }
 
 
-def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=True,
+def run_train_candidates(candidates_path, output_path, sample_rate, embedding_model, all_medoids=True,
                           dtw_restarts=None, dtw_density_tolerance=None, min_match_states=None,
                           dtw_norm=None, dtw_zscore=False, variance='medoid', dtw_max_candidates=None):
     """
@@ -1036,6 +1071,7 @@ def run_train_candidates(candidates_path, output_path, sample_rate, all_medoids=
         'python', '-u', MOTIF_DISCOVERY_SCRIPT, 'train-candidates',
         candidates_path, output_path,
         '--sample-rate', str(sample_rate),
+        '--embedding-model', embedding_model,
         '--model-name', EXTEND_MODEL_NAME,
         '--verbose',
     ]
@@ -1066,12 +1102,20 @@ def count_hits(motif_hits_csv):
         return max(0, sum(1 for _ in f) - 1)
 
 
-def restore_noise_embeddings(output_path, service=None, embeddings_cache_folder_id=None):
+def noise_cache_paths(embedding_model):
+    """(job-local path, Drive entry name) of the packaged noise wav's cached
+    embeddings under embedding_model."""
+    suffix = model_suffix(embedding_model)
+    return (NOISE_EMBEDDINGS_CACHE_PATH.format(suffix=suffix),
+            NOISE_EMBEDDINGS_CACHE_NAME.format(version=NOISE_EMBEDDINGS_CACHE_VERSION, suffix=suffix))
+
+
+def restore_noise_embeddings(output_path, embedding_model, service=None, embeddings_cache_folder_id=None):
     """
     Seed output_path/noise_embeddings.pkl so build_noise_model() loads it
     instead of re-embedding the packaged, never-changing noise wav from
     scratch. Two layers, cheapest first:
-      1. The job-local NOISE_EMBEDDINGS_CACHE_PATH, if an earlier file in
+      1. The job-local cache (noise_cache_paths()), if an earlier file in
          this same job already produced one.
       2. The persistent Drive cache (embeddings_cache_folder_id, the same
          motif_embeddings_cache folder find's own per-recording embeddings
@@ -1087,9 +1131,10 @@ def restore_noise_embeddings(output_path, service=None, embeddings_cache_folder_
     unwritable/unreachable cache must never take down the actual run --
     worst case find re-embeds the noise.
     """
+    local_cache, cache_name = noise_cache_paths(embedding_model)
     try:
-        if os.path.exists(NOISE_EMBEDDINGS_CACHE_PATH):
-            shutil.copy2(NOISE_EMBEDDINGS_CACHE_PATH, os.path.join(output_path, 'noise_embeddings.pkl'))
+        if os.path.exists(local_cache):
+            shutil.copy2(local_cache, os.path.join(output_path, 'noise_embeddings.pkl'))
             print("  Reusing noise embeddings from this job's earlier file")
             return
     except OSError as e:
@@ -1098,19 +1143,19 @@ def restore_noise_embeddings(output_path, service=None, embeddings_cache_folder_
     if service is None or embeddings_cache_folder_id is None:
         return
     try:
-        cached_id = find_file(service, embeddings_cache_folder_id, NOISE_EMBEDDINGS_CACHE_NAME)
+        cached_id = find_file(service, embeddings_cache_folder_id, cache_name)
         if not cached_id:
             return
-        print(f"  Using cached noise embeddings from Drive: {NOISE_EMBEDDINGS_CACHE_NAME}")
+        print(f"  Using cached noise embeddings from Drive: {cache_name}")
         dest = os.path.join(output_path, 'noise_embeddings.pkl')
         download_file(service, cached_id, dest)
-        os.makedirs(os.path.dirname(NOISE_EMBEDDINGS_CACHE_PATH), exist_ok=True)
-        shutil.copy2(dest, NOISE_EMBEDDINGS_CACHE_PATH)
+        os.makedirs(os.path.dirname(local_cache), exist_ok=True)
+        shutil.copy2(dest, local_cache)
     except Exception as e:
         print(f"  (Drive noise embeddings cache fetch failed, re-embedding: {e})")
 
 
-def save_noise_embeddings(output_path, service=None, embeddings_cache_folder_id=None):
+def save_noise_embeddings(output_path, embedding_model, service=None, embeddings_cache_folder_id=None):
     """
     Stash this run's noise_embeddings.pkl (produced because restore_noise_
     embeddings() found nothing cached anywhere) both job-locally, for this
@@ -1122,25 +1167,26 @@ def save_noise_embeddings(output_path, service=None, embeddings_cache_folder_id=
     produced = os.path.join(output_path, 'noise_embeddings.pkl')
     if not os.path.exists(produced):
         return
+    local_cache, cache_name = noise_cache_paths(embedding_model)
 
-    if not os.path.exists(NOISE_EMBEDDINGS_CACHE_PATH):
+    if not os.path.exists(local_cache):
         try:
-            os.makedirs(os.path.dirname(NOISE_EMBEDDINGS_CACHE_PATH), exist_ok=True)
-            shutil.copy2(produced, NOISE_EMBEDDINGS_CACHE_PATH)
+            os.makedirs(os.path.dirname(local_cache), exist_ok=True)
+            shutil.copy2(produced, local_cache)
         except OSError as e:
             print(f"  (could not stash noise embeddings locally, next file will re-embed: {e})")
 
     if service is None or embeddings_cache_folder_id is None:
         return
     try:
-        if not find_file(service, embeddings_cache_folder_id, NOISE_EMBEDDINGS_CACHE_NAME):
-            print(f"  Caching noise embeddings to Drive: {NOISE_EMBEDDINGS_CACHE_NAME}")
-            upload_file(service, embeddings_cache_folder_id, produced, NOISE_EMBEDDINGS_CACHE_NAME)
+        if not find_file(service, embeddings_cache_folder_id, cache_name):
+            print(f"  Caching noise embeddings to Drive: {cache_name}")
+            upload_file(service, embeddings_cache_folder_id, produced, cache_name)
     except Exception as e:
         print(f"  (caching noise embeddings to Drive failed, will re-embed next job: {e})")
 
 
-def process_one_file(service, file_info, run_output_folder_id, noise_components, noise_var_scale,
+def process_one_file(service, file_info, run_output_folder_id, embedding_model, noise_components, noise_var_scale,
                       hit_gap_seconds, embeddings_cache_folder_id=None, require_full_match=False,
                       pvl_path=None, gap_dwell_frames=None, repeat_prob=None):
     """
@@ -1163,7 +1209,7 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
     """
     name = file_info['name']
     stem = Path(name).stem
-    cache_name = f"{stem}.{EMBEDDINGS_CACHE_VERSION}.pkl"
+    cache_name = f"{stem}.{EMBEDDINGS_CACHE_VERSION}{model_suffix(embedding_model)}.pkl"
     work_dir = tempfile.mkdtemp(prefix='motif_find_')
     try:
         output_path = os.path.join(work_dir, 'output')
@@ -1199,14 +1245,15 @@ def process_one_file(service, file_info, run_output_folder_id, noise_components,
         print(f"  Converting to mono (first channel): {name}")
         convert_to_mono_first_channel(raw_path, mono_path)
 
-        restore_noise_embeddings(output_path, service, embeddings_cache_folder_id)
+        restore_noise_embeddings(output_path, embedding_model, service, embeddings_cache_folder_id)
 
         print(f"  Running find: {name}")
-        run_find(mono_path, output_path, noise_components, noise_var_scale, hit_gap_seconds,
+        run_find(mono_path, output_path, os.path.join(BAKED_L2_DIRS[embedding_model], BAKED_MODEL_NAME),
+                 noise_components, noise_var_scale, hit_gap_seconds,
                  require_full_match=require_full_match, gap_dwell_frames=gap_dwell_frames,
                  repeat_prob=repeat_prob)
 
-        save_noise_embeddings(output_path, service, embeddings_cache_folder_id)
+        save_noise_embeddings(output_path, embedding_model, service, embeddings_cache_folder_id)
 
         hits = count_hits(os.path.join(output_path, 'motif_hits.csv'))
 
@@ -1324,6 +1371,10 @@ def handle_extend(job_input):
         find_pvl_only         -- default False; True restricts the find stage
                                  (and, once candidates exist, embedding) to
                                  folders with a pvl_file_id
+        embedding_model       -- default "whisper"; picks the baked L2
+                                 candidates to extend and gets its own extend
+                                 state folder (motif_extend_state.<model> for
+                                 non-whisper models) and embeddings cache entries
 
     Returns a dict with "stage": "find" (this always finishes there now)
     and a "stages_completed" list saying which of candidates_built /
@@ -1373,6 +1424,11 @@ def handle_extend(job_input):
     find_pvl_only = bool(job_input.get('find_pvl_only', False))
     if find_pvl_only and not any(pvl_ids_by_folder):
         return {"error": "find_pvl_only is set but no folder has a pvl_file_id"}
+    embedding_model = job_input.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
+    if embedding_model not in EMBEDDING_MODELS:
+        return {"error": f"embedding_model must be one of {sorted(EMBEDDING_MODELS)}, got {embedding_model!r}"}
+    baked_dir = BAKED_L2_DIRS[embedding_model]
+    print(f"Embedding model: {embedding_model} (baked L2 assets: {baked_dir})")
 
     service = get_drive_service()
     # output_gdrive_folder_id, or the first input folder if not given -- same
@@ -1395,10 +1451,11 @@ def handle_extend(job_input):
     files, dropped = dedupe_by_stem(files, has_pvl=lambda f: bool(folder_to_pvl_id.get(f['_source_folder_id'])))
     _log_dedupe(files, dropped)
 
-    state_folder_id = find_or_create_folder(service, parent_folder_for_output, EXTEND_STATE_FOLDER_NAME)
+    state_folder_id = find_or_create_folder(service, parent_folder_for_output,
+                                            EXTEND_STATE_FOLDER_NAME + model_suffix(embedding_model))
     embeddings_cache_folder_id = find_or_create_folder(service, parent_folder_for_output, EMBEDDINGS_CACHE_FOLDER_NAME)
 
-    training_sample_rate = read_training_sample_rate(TRAINING_METADATA_PATH)
+    training_sample_rate = read_training_sample_rate(os.path.join(baked_dir, TRAINING_METADATA_NAME))
     print(f"Baked model's training rate: {training_sample_rate} Hz (embedding new audio at this rate to match)")
 
     candidates_id = find_file(service, state_folder_id, EXTEND_CANDIDATES_NAME)
@@ -1430,7 +1487,7 @@ def handle_extend(job_input):
             name = file_info['name']
             stem = Path(name).stem
             print(f"\n[{i + 1}/{len(files)}] embedding {name}")
-            cache_name = f"{stem}.{cache_version}.pkl"
+            cache_name = f"{stem}.{cache_version}{model_suffix(embedding_model)}.pkl"
             work_dir = tempfile.mkdtemp(prefix='motif_extend_')
             work_dirs.append(work_dir)
             output_path = os.path.join(work_dir, 'output')
@@ -1466,7 +1523,7 @@ def handle_extend(job_input):
 
             if not embeddings_cached:
                 print(f"  Embedding: {name}")
-                run_embed(mono_path, output_path, training_sample_rate)
+                run_embed(mono_path, output_path, training_sample_rate, embedding_model)
                 if os.path.exists(embeddings_path):
                     try:
                         print(f"  Caching embeddings to Drive: {cache_name}")
@@ -1495,7 +1552,7 @@ def handle_extend(job_input):
                     shutil.copy2(e["mono_path"], os.path.join(dest, "audio.wav"))
 
                 baked_local = os.path.join(embroot, "baked_candidates.pkl")
-                shutil.copy2(BAKED_CANDIDATES_PATH, baked_local)
+                shutil.copy2(os.path.join(baked_dir, BAKED_CANDIDATES_NAME), baked_local)
                 combined_local = os.path.join(embroot, EXTEND_CANDIDATES_NAME)
                 run_extend_candidates(baked_local, embroot, combined_local, min_region_frames,
                                       smooth_candidates)
@@ -1534,7 +1591,8 @@ def handle_extend(job_input):
                 download_file(service, candidates_id, candidates_local)
                 train_output = os.path.join(train_work_dir, 'output')
                 os.makedirs(train_output, exist_ok=True)
-                run_train_candidates(candidates_local, train_output, training_sample_rate, all_medoids=all_medoids,
+                run_train_candidates(candidates_local, train_output, training_sample_rate, embedding_model,
+                                      all_medoids=all_medoids,
                                       dtw_restarts=dtw_restarts, dtw_density_tolerance=dtw_density_tolerance,
                                       min_match_states=min_match_states, dtw_norm=dtw_norm,
                                       dtw_zscore=dtw_zscore, variance=variance,
@@ -1614,14 +1672,14 @@ def handle_extend(job_input):
                 stem = e["stem"]
                 print(f"\n[{i + 1}/{len(find_targets)}] {name}")
                 try:
-                    restore_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
+                    restore_noise_embeddings(e["output_path"], embedding_model, service, embeddings_cache_folder_id)
 
                     print(f"  Running find: {name}")
-                    run_find(e["mono_path"], e["output_path"], noise_components, noise_var_scale,
-                             hit_gap_seconds, require_full_match=require_full_match, model_path=model_local,
+                    run_find(e["mono_path"], e["output_path"], model_local, noise_components, noise_var_scale,
+                             hit_gap_seconds, require_full_match=require_full_match,
                              gap_dwell_frames=gap_dwell_frames, repeat_prob=repeat_prob)
 
-                    save_noise_embeddings(e["output_path"], service, embeddings_cache_folder_id)
+                    save_noise_embeddings(e["output_path"], embedding_model, service, embeddings_cache_folder_id)
 
                     hits = count_hits(os.path.join(e["output_path"], "motif_hits.csv"))
                     pvl_path = pvl_paths_by_id.get(e["pvl_file_id"])
@@ -1711,6 +1769,9 @@ def handler(job):
         gap_dwell_frames, repeat_prob = _parse_search_transitions(job_input)
     except (TypeError, ValueError) as e:
         return {"error": str(e)}
+    embedding_model = job_input.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
+    if embedding_model not in EMBEDDING_MODELS:
+        return {"error": f"embedding_model must be one of {sorted(EMBEDDING_MODELS)}, got {embedding_model!r}"}
 
     if not gdrive_folder_id:
         return {"error": "gdrive_folder_id is required"}
@@ -1726,7 +1787,7 @@ def handler(job):
     print(f"Output Google Drive folder: {output_gdrive_folder_id or '(same as input)'}")
     print(f"noise_components={noise_components} noise_var_scale={noise_var_scale} "
           f"hit_gap_seconds={hit_gap_seconds} require_full_match={require_full_match} "
-          f"gap_dwell_frames={gap_dwell_frames} repeat_prob={repeat_prob}")
+          f"gap_dwell_frames={gap_dwell_frames} repeat_prob={repeat_prob} embedding_model={embedding_model}")
 
     try:
         print("\nInitializing Google Drive connection...")
@@ -1779,7 +1840,7 @@ def handler(job):
             for i, file_info in enumerate(files):
                 print(f"\n[{i + 1}/{len(files)}] {file_info['name']}")
                 results.append(process_one_file(
-                    service, file_info, run_output_folder_id,
+                    service, file_info, run_output_folder_id, embedding_model,
                     noise_components, noise_var_scale, hit_gap_seconds,
                     embeddings_cache_folder_id=cache_folder_id,
                     require_full_match=require_full_match,

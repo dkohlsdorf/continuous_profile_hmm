@@ -86,11 +86,25 @@ RUN python -c "from transformers import WhisperModel, WhisperProcessor; \
     WhisperModel.from_pretrained('openai/whisper-small'); \
     print('Whisper small cached')"
 
+# Same for the EmbeddingGemma2 base the --embedding-model gemma_* options
+# load (audio tower only, LoRA + heads from model/ below). Pass an HF token
+# as a build secret if the model is gated for your account:
+#   docker buildx build --secret id=hf_token,env=HF_TOKEN ...
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token 2>/dev/null) python -c "from transformers import AutoConfig, AutoModel, AutoFeatureExtractor; \
+    AutoConfig.from_pretrained('google/embeddinggemma-2'); \
+    AutoModel.from_pretrained('google/embeddinggemma-2'); \
+    AutoFeatureExtractor.from_pretrained('google/embeddinggemma-2'); \
+    print('EmbeddingGemma2 cached')"
+
 # Fine-tuned embedding/classification checkpoint (CONFIG['checkpoint_path']
 # in lib_phmm/config.py is this same relative path, resolved against
 # whatever the process's cwd is -- handler.py always runs motif_discovery.py
 # with cwd=/app).
 COPY model/wdp_whisper_emb_model_L2.pt ./model/wdp_whisper_emb_model_L2.pt
+# EmbeddingGemma2 LoRA adapters + heads (lib_phmm.config.EMBEDDING_MODELS).
+COPY model/wdp-embeddinggemma2-decoder_extended_balanced_noiseaug ./model/wdp-embeddinggemma2-decoder_extended_balanced_noiseaug
+COPY model/wdp-embeddinggemma2-decoder_extended_balanced_noiseaug_hr ./model/wdp-embeddinggemma2-decoder_extended_balanced_noiseaug_hr
 
 # Trained L2 motif model + the --noise-wav recording, staged into
 # serverless/runpod_worker/assets/ (see .gitignore) since /motif/ is
@@ -110,6 +124,14 @@ COPY serverless/runpod_worker/assets/candidates.pkl ./motif/l2/candidates.pkl
 # motif_discovery.py). `train` writes this next to the model it produces;
 # it's staged here because the packaged phmm_l2.pkl predates that.
 COPY serverless/runpod_worker/assets/training_metadata.json ./motif/l2/training_metadata.json
+
+# The same three L2 assets per EmbeddingGemma2 model (handler.py's
+# BAKED_L2_DIRS), produced by `motif_discovery.py train --embedding-model
+# <model>` on L2.csv/L2.wav -- an HMM/candidate pool only works in the
+# embedding space it was built in. Their training_metadata.json records the
+# embedding model, which find reads to embed search audio the same way.
+COPY serverless/runpod_worker/assets/l2_gemma_noiseaug/ ./motif/l2_gemma_noiseaug/
+COPY serverless/runpod_worker/assets/l2_gemma_noiseaug_hr/ ./motif/l2_gemma_noiseaug_hr/
 
 # Code last: everything above is large and rarely changes, so a code-only
 # change rebuilds/pushes only these small layers instead of re-uploading

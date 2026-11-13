@@ -132,8 +132,8 @@ from joblib import Parallel, delayed
 # outside it, e.g. locally.
 torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 
-from lib_phmm.config import CONFIG
-from lib_phmm.model import whisper_model_v2, whisper_processor
+from lib_phmm.config import CONFIG, EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL
+from lib_phmm.model import load_embedding_model
 from lib_phmm.signals import load_filtered_waveform, process, classify, class_probabilities, LABEL_MAP
 from lib_phmm import viterbi_smoothing
 from lib_phmm.phmm_utils import sweep_one_state_count, score_all_as_submodels, make_hmm, decode_all, best_fit, dwell_to_prior_mean, filter_candidates_by_medoid, cap_members, VARIANCE_MODES
@@ -292,7 +292,7 @@ def load_embeddings_cache(embeddings_path):
     return cached
 
 
-def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=None):
+def embed_and_cache(wav_path, output_path, embedding_model, verbose=False, target_sample_rate=None):
     """
     Embed one file via embed_full_file(), caching to output_path/
     embeddings.pkl in the (embeddings, classifications, step_samples,
@@ -306,10 +306,9 @@ def embed_and_cache(wav_path, output_path, verbose=False, target_sample_rate=Non
         embeddings, classifications, step_samples, sample_rate, _ = load_embeddings_cache(embeddings_path)
         print(f"Loaded cached embeddings from: {embeddings_path}")
     else:
-        whisper_model = whisper_model_v2()
-        processor     = whisper_processor()
+        model, processor = load_embedding_model(embedding_model)
         embeddings, classifications, step_samples, sample_rate, class_probs = embed_full_file(
-            wav_path, whisper_model, processor, verbose=verbose,
+            wav_path, model, processor, verbose=verbose,
             target_sample_rate=target_sample_rate)
         with open(embeddings_path, "wb") as f:
             pkl.dump((embeddings, classifications, step_samples, sample_rate, class_probs), f)
@@ -480,7 +479,7 @@ def training_metadata_path(model_path):
     return Path(model_path).parent / TRAINING_METADATA_NAME
 
 
-def save_training_metadata(output_path, sample_rate, wav_path):
+def save_training_metadata(output_path, sample_rate, wav_path, embedding_model):
     """
     Record what `train` actually ran on, next to the model it produced.
 
@@ -491,16 +490,34 @@ def save_training_metadata(output_path, sample_rate, wav_path):
     Searching a recording at a different rate silently shifts it in
     pitch/time relative to everything the model learned. Persisting the
     rate here lets find resample to match instead of hardcoding it.
+
+    embedding_model (an EMBEDDING_MODELS key) is the model the training
+    candidates were embedded with -- find has to embed search audio with
+    the same one, or the HMM's emissions live in a different space.
     """
     meta = {
         "sample_rate": int(sample_rate),
+        "embedding_model": embedding_model,
         "trained_from": str(wav_path),
         "written_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     path = Path(output_path) / TRAINING_METADATA_NAME
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"Wrote training metadata ({sample_rate} Hz) to: {path}")
+    print(f"Wrote training metadata ({sample_rate} Hz, {embedding_model}) to: {path}")
+
+
+def load_training_embedding_model(model_path):
+    """
+    The embedding model the model at model_path was trained on, from its
+    sidecar -- DEFAULT_EMBEDDING_MODEL (whisper) for models written before
+    this was recorded, which all used it.
+    """
+    path = training_metadata_path(model_path)
+    if not path.exists():
+        return DEFAULT_EMBEDDING_MODEL
+    with open(path) as f:
+        return json.load(f).get("embedding_model", DEFAULT_EMBEDDING_MODEL)
 
 
 def load_training_sample_rate(model_path):
@@ -838,7 +855,7 @@ def run_train(args):
     # itself is loaded from cache below -- find needs it either way.
     with wave.open(str(args.wav_path), 'rb') as _w:
         training_sample_rate = _w.getframerate()
-    save_training_metadata(output_path, training_sample_rate, args.wav_path)
+    save_training_metadata(output_path, training_sample_rate, args.wav_path, args.embedding_model)
 
     print("==========================================")
     print("Motif discovery: embedding candidates       ")
@@ -849,8 +866,7 @@ def run_train(args):
             candidates = pkl.load(f)
         print(f"Loaded cached candidate embeddings from: {candidates_path}")
     else:
-        model      = whisper_model_v2()
-        processor  = whisper_processor()
+        model, processor = load_embedding_model(args.embedding_model)
         candidates = load_candidates(args.csv_path, args.wav_path, model, processor, verbose=args.verbose)
         with open(candidates_path, "wb") as f:
             pkl.dump(candidates, f)
@@ -976,7 +992,7 @@ def apply_search_transitions(hmm, repeat_prob, gap_dwell_frames):
     hmm.trans.jb = math.log2(1.0 - jj)
 
 
-def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=False,
+def build_noise_model(noise_wav_path, output_path, embedding_model, n_components=None, bayesian=False,
                        var_floor=0.1, var_scale=1.0, verbose=False, seed=None,
                        target_sample_rate=None):
     """
@@ -1033,8 +1049,7 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
             embeddings, _ = pkl.load(f)
         print(f"Loaded cached noise embeddings from: {embeddings_path}")
     else:
-        whisper_model = whisper_model_v2()
-        processor     = whisper_processor()
+        model, processor = load_embedding_model(embedding_model)
         # noise model only fits a Gaussian/GMM over embeddings -- per-window
         # classifications aren't needed here (unlike find_in_file's
         # embeddings.pkl), so they're computed (free, same forward pass)
@@ -1042,7 +1057,7 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
         # Same target rate as the search audio: the noise model is one side
         # of a likelihood ratio against the match states, so it has to be
         # fit in the same domain or the comparison is meaningless.
-        embeddings, _, step_samples, _, _ = embed_full_file(noise_wav_path, whisper_model, processor,
+        embeddings, _, step_samples, _, _ = embed_full_file(noise_wav_path, model, processor,
                                                           verbose=verbose,
                                                           target_sample_rate=target_sample_rate)
         with open(embeddings_path, "wb") as f:
@@ -1079,7 +1094,7 @@ def build_noise_model(noise_wav_path, output_path, n_components=None, bayesian=F
     return phmm.MixtureModel(components, log_weights)
 
 
-def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None, verbose=False,
+def find_in_file(wav_path, output_path, hmm, n_states, n_models, embedding_model, noise_pdf=None, verbose=False,
                   hit_gap_seconds=0.5, target_sample_rate=None, require_full_match=False):
     """
     Search one recording for hmm's motifs: embed it (cached to
@@ -1100,7 +1115,7 @@ def find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=None,
     print("Motif search: embedding target file        ")
     print("==========================================")
     embeddings, classifications, step_samples, sample_rate = embed_and_cache(
-        wav_path, output_path, verbose=verbose, target_sample_rate=target_sample_rate)
+        wav_path, output_path, embedding_model, verbose=verbose, target_sample_rate=target_sample_rate)
 
     print("==========================================")
     print("Motif search: decoding                     ")
@@ -1197,6 +1212,13 @@ def run_find(args):
               f"--resample-hz -- audio is used at its own rate, which is only correct if "
               f"it already matches whatever the model was trained on.")
 
+    # Search audio has to be embedded with the model the HMM was trained on.
+    embedding_model = load_training_embedding_model(args.model_path)
+    if args.embedding_model is not None and args.embedding_model != embedding_model:
+        raise SystemExit(f"--embedding-model {args.embedding_model} doesn't match the {embedding_model} "
+                         f"embeddings {args.model_path} was trained on ({TRAINING_METADATA_NAME})")
+    print(f"Embedding model (from {TRAINING_METADATA_NAME}): {embedding_model}")
+
     output_path = Path(args.output_path)
     wav_path = Path(args.wav_path)
 
@@ -1208,7 +1230,7 @@ def run_find(args):
         print("==========================================")
         print("Motif search: building noise model         ")
         print("==========================================")
-        noise_pdf = build_noise_model(Path(args.noise_wav), output_path,
+        noise_pdf = build_noise_model(Path(args.noise_wav), output_path, embedding_model,
                                        n_components=args.noise_components, bayesian=args.noise_bayesian,
                                        var_scale=args.noise_var_scale, verbose=args.verbose,
                                        target_sample_rate=target_sample_rate)
@@ -1227,12 +1249,12 @@ def run_find(args):
             print("==========================================")
             print(f"[{i + 1}/{len(wav_files)}] {wav_file.name}")
             print("==========================================")
-            find_in_file(wav_file, output_path / wav_file.stem, hmm, n_states, n_models,
+            find_in_file(wav_file, output_path / wav_file.stem, hmm, n_states, n_models, embedding_model,
                          noise_pdf=noise_pdf, verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds,
                          target_sample_rate=target_sample_rate, require_full_match=args.require_full_match)
     else:
         output_path.mkdir(parents=True, exist_ok=True)
-        find_in_file(wav_path, output_path, hmm, n_states, n_models, noise_pdf=noise_pdf,
+        find_in_file(wav_path, output_path, hmm, n_states, n_models, embedding_model, noise_pdf=noise_pdf,
                      verbose=args.verbose, hit_gap_seconds=args.hit_gap_seconds,
                      target_sample_rate=target_sample_rate, require_full_match=args.require_full_match)
 
@@ -1259,10 +1281,10 @@ def run_embed(args):
             print("==========================================")
             print(f"[{i + 1}/{len(wav_files)}] {wav_file.name}")
             print("==========================================")
-            embed_and_cache(wav_file, output_path / wav_file.stem, verbose=args.verbose,
+            embed_and_cache(wav_file, output_path / wav_file.stem, args.embedding_model, verbose=args.verbose,
                              target_sample_rate=args.resample_hz)
     else:
-        embed_and_cache(wav_path, output_path, verbose=args.verbose, target_sample_rate=args.resample_hz)
+        embed_and_cache(wav_path, output_path, args.embedding_model, verbose=args.verbose, target_sample_rate=args.resample_hz)
     print("==========================================")
     print("Done")
     print("==========================================")
@@ -1437,7 +1459,7 @@ def run_train_candidates(args):
     model_name = args.model_name or "phmm_extended.pkl"
     model_path = output_path / model_name
 
-    save_training_metadata(output_path, args.sample_rate, args.candidates_path)
+    save_training_metadata(output_path, args.sample_rate, args.candidates_path, args.embedding_model)
 
     dt = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     hmm, n_states, n_models, best, flank_dwell_frames, n_filtered = fit_model_from_candidates(candidates, args)
@@ -1497,6 +1519,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- n_match_states is the cap on piecewise segments used to compress each candidate (see top_k_switchpoints()/make_hmm()), so raising this floor forces the sweep to only consider models rich enough to represent motifs with more turns/segments than the default floor allows. Useful with --all-medoids: count_params()'s BIC penalty scales with n_sub_models * n_match_states, so a large n_sub_models pool can make BIC floor n_match_states at the sweep's minimum regardless of true motif complexity -- raising this floor is how to override that.")
     train_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
+    train_parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING_MODEL, help=f"embedding/classifier model to embed audio with: {{{', '.join(EMBEDDING_MODELS)}}} (default {DEFAULT_EMBEDDING_MODEL}). Recorded in training_metadata.json so find embeds search audio with the same model. candidates.pkl in output_path is reused regardless -- delete it after switching models.")
     train_parser.add_argument("--verbose", action="store_true", help="log progress while embedding candidates and while decoding the full candidate pool against the final model")
     train_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup), since candidates carry little/no real NOISE for nn/cc to learn from otherwise")
     train_parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior -- higher pulls closer to --flank-dwell-frames, lower lets any real observed NOISE counts matter more")
@@ -1507,6 +1530,7 @@ if __name__ == "__main__":
     find_parser.add_argument("wav_path", help="recording to search for motifs, or a directory of .wav files to search each of independently (one output_path/<wav stem>/ subfolder per file)")
     find_parser.add_argument("output_path", help="output directory for motif_hits.csv, embeddings.pkl cache, and submodel_<n>_hits.wav (any submodel_*_hits.wav left here from a prior find run against this output_path is cleared before this run's clips are written)")
     find_parser.add_argument("--verbose", action="store_true", help="log progress while embedding the target file")
+    find_parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=None, help=f"embedding model to embed search and --noise-wav audio with. Normally omitted: it's read from {TRAINING_METADATA_NAME} next to the model (whisper if absent), since it has to be the one the model was trained on -- passing a different one is an error. Cached embeddings.pkl/noise_embeddings.pkl in output_path are reused regardless, so use a fresh output_path per embedding model.")
     find_parser.add_argument("--repeat-prob", type=float, default=0.999, help="probability of looping back (E->J->B) to keep scanning for another occurrence after a hit, instead of exiting to background forever (E->C, a dead end in this topology) -- overrides the trained ec/ej, which come from single-occurrence training candidates and are unusable for scanning a long file as-is (see run_find()'s comment). Default strongly favors continuing to scan.")
     find_parser.add_argument("--gap-dwell-frames", type=float, default=100.0, help="expected background gap (in frames) the model should tolerate between two motif occurrences before giving up on finding another one nearby -- overrides jj/jb, hardcoded elsewhere to a ~1-frame dwell (fine within training, unusable for scanning a file with real gaps between hits). Generous default: underestimating this risks missing real hits, overestimating mainly costs a bit of false-positive risk once inside a real match.")
     find_parser.add_argument("--noise-wav", default=None, help="optional recording of background/non-motif audio. If given, N/J/C (background states) get a real emission model -- a MixtureModel fit to this file's embeddings (see --noise-components) -- competing against match states for each frame, instead of being silent/transition-only. This is what actually fixes segments bleeding into surrounding noise (widened start/stop spans), which --repeat-prob/--gap-dwell-frames don't touch at all (those only control whether to look for another occurrence, not how tightly one occurrence's span is drawn). Ad hoc for this run only -- never touches train/processing.py or the saved model. Omit to keep today's behavior exactly.")
@@ -1521,6 +1545,7 @@ if __name__ == "__main__":
     embed_parser.add_argument("wav_path", help="recording to embed, or a directory of .wav files to embed each of independently (one output_path/<wav stem>/ subfolder per file)")
     embed_parser.add_argument("output_path", help="output directory for embeddings.pkl (same cache format/location `find` reads -- a later `find` against this output_path skips re-embedding)")
     embed_parser.add_argument("--verbose", action="store_true", help="log progress while embedding")
+    embed_parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING_MODEL, help=f"embedding/classifier model to embed audio with: {{{', '.join(EMBEDDING_MODELS)}}} (default {DEFAULT_EMBEDDING_MODEL}). Must match whatever candidates.pkl/model these embeddings will be combined with or searched against. An existing embeddings.pkl in output_path is reused regardless.")
     embed_parser.add_argument("--resample-hz", type=int, default=None, help="resample audio to this rate before embedding. Pass the rate whatever candidates.pkl/model this embedding will be combined with or searched against was itself embedded at -- nothing in this pipeline resamples on its own otherwise.")
 
     extend_candidates_parser = subparsers.add_parser("extend-candidates", help="grow a baked candidates.pkl with new candidates mined from already-embedded files' non-NOISE regions")
@@ -1550,6 +1575,7 @@ if __name__ == "__main__":
     train_candidates_parser.add_argument("--dtw-seed", type=int, default=0, help="random seed for --dtw-max-candidates' sample")
     train_candidates_parser.add_argument("--min-match-states", type=int, default=MIN_STATES, help=f"floor for the BIC n_match_states sweep (default {MIN_STATES}) -- see train's --min-match-states for why this matters especially with --all-medoids")
     train_candidates_parser.add_argument("--well-fit-threshold", type=float, default=34, help="per-sequence normalized Viterbi score below which a candidate counts as well-fit")
+    train_candidates_parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING_MODEL, help=f"embedding/classifier model to embed audio with: {{{', '.join(EMBEDDING_MODELS)}}} (default {DEFAULT_EMBEDDING_MODEL}). Has to be the model candidates_path was embedded with (it isn't recorded in candidates.pkl) -- written into training_metadata.json so find embeds search audio the same way.")
     train_candidates_parser.add_argument("--verbose", action="store_true", help="log progress while decoding the full candidate pool against the final model")
     train_candidates_parser.add_argument("--flank-dwell-frames", type=float, default=None, help="target expected N/C flank dwell length in frames -- default: mean candidate length (printed at startup)")
     train_candidates_parser.add_argument("--flank-alpha", type=float, default=500.0, help="pseudocount weight for the flank dwell prior")
