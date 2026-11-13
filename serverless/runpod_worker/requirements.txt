@@ -3,8 +3,10 @@
 numpy==1.26.4
 pandas>=2.0.0
 joblib
-transformers==4.54.0
-peft==0.16.0
+# Gemma4AudioModel (the EmbeddingGemma2 embedding models) needs transformers 5;
+# pinned to the versions those models were tested with locally.
+transformers==5.20.2
+peft==0.19.1
 pybind11==3.0.0
 scikit-learn
 openpyxl

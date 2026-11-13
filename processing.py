@@ -2,7 +2,7 @@ import os
 import argparse
 import datetime
 import pickle as pkl
-from lib_phmm.config import CONFIG
+from lib_phmm.config import CONFIG, EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL
 from lib_phmm.model import *
 from lib_phmm.signals import *
 from lib_phmm.phmm_utils import *
@@ -33,6 +33,7 @@ if __name__ == "__main__":
     parser.add_argument("--shrinkage", type=float, default=10.0, help="--variance cluster only: pseudo-frames pulling each state towards its medoid's mean and the shared variance")
     parser.add_argument("--path", default="../audio/aggression", help="directory containing the input .wav files")
     parser.add_argument("--output-path", default=None, help="directory for cached embeddings/results and plots (default: <path>/output)")
+    parser.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING_MODEL, help="embedding/classifier model to embed the wav files with (default %(default)s). Cached embeddings.pkl in the output path are reused regardless -- use a fresh --output-path per model")
     args = parser.parse_args()
     if args.variance != 'medoid' and not args.motif_mode_filtered:
         parser.error(f"--variance {args.variance} needs --motif-mode-filtered (it builds sub-models from DTW clusters)")
@@ -67,8 +68,7 @@ if __name__ == "__main__":
             print(f"Loaded cached embeddings from: {embeddings_path}")
 
     if embeddings is None:
-        model      = whisper_model_v2()
-        processor  = whisper_processor()
+        model, processor = load_embedding_model(args.embedding_model)
         embeddings = []
         for file in files:
             embeddings.append(load_file(file, model, processor, motif_mode=args.motif_mode or args.motif_mode_filtered))
