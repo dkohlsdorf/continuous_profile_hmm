@@ -1,0 +1,16 @@
+{
+  "name": "dolphin-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "images": "python3 -m http.server 8788 --directory \"${DATA_DIR:-$HOME/Documents/dolphin_web_data}\"",
+    "db:dump": "sh scripts/dump_d1.sh",
+    "db:local": "npm run db:dump && wrangler d1 execute DB --local --file web.sql",
+    "db:remote": "npm run db:dump && wrangler d1 execute DB --remote --file web.sql",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.156.2"
+  }
+}

@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dolphin Motif Browser</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66;
+    --line: #dcdcd6; --accent: #1f6feb; --row-h: 64px;
+    --BURST: #d97706; --ECHO: #7c3aed; --WHISTLE: #0d9488;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 10; display: flex; flex-wrap: wrap; gap: 8px 24px;
+           align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  header select, header input { font: inherit; }
+  #summary b { color: var(--ink); }
+  #reset { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+           border: 1px solid #c0392b; background: var(--panel); color: #c0392b; }
+  #reset:hover { background: #c0392b; color: #fff; }
+  #summary { margin-left: auto; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  main { padding: 8px 0 40px; }
+  .row { display: flex; align-items: center; gap: 4px; padding: 4px 16px 4px 0;
+         border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .label { position: sticky; left: 0; z-index: 1; flex: 0 0 170px; align-self: stretch;
+           display: flex; flex-direction: column; justify-content: center;
+           padding: 0 10px 0 16px; background: var(--bg); font-variant-numeric: tabular-nums; }
+  .label b { font-size: 13px; }
+  .label span { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .label .maj { display: flex; align-items: center; gap: 5px; color: var(--ink); }
+  .hit { position: relative; flex: 0 0 auto; line-height: 0; }
+  img.spec { height: var(--row-h); background: #fff; border: 1px solid var(--line);
+             border-bottom: 4px solid var(--type); object-fit: fill; cursor: pointer; }
+  img.spec:hover { outline: 2px solid var(--accent); outline-offset: -1px; }
+  img.spec.selected { outline: 3px solid var(--accent); outline-offset: -1px; }
+  .badge { position: absolute; top: 2px; right: 2px; padding: 0 3px; border-radius: 3px;
+           font: 600 10px/14px system-ui, sans-serif; color: #fff; background: var(--type); pointer-events: none; }
+  .chip { display: inline-block; width: 9px; height: 9px; border-radius: 2px; background: var(--type); }
+  .t-BURST { --type: var(--BURST); } .t-ECHO { --type: var(--ECHO); } .t-WHISTLE { --type: var(--WHISTLE); }
+  #types { display: grid; grid-template-columns: repeat(3, auto); gap: 2px 14px; align-items: center;
+           font-size: 13px; color: var(--muted); }
+  #types label { gap: 5px; }
+  #types .type { color: var(--ink); font-weight: 600; }
+  #types input[type=range] { width: 140px; }
+  #types output { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 4.5ch; }
+  #tip { position: fixed; z-index: 20; display: none; max-width: calc(100vw - 32px);
+         padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+         box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+  #tip .frame { position: relative; display: inline-block; line-height: 0; }
+  #tip .frame img { max-height: 200px; max-width: calc(100vw - 50px); background: #fff; }
+  #tip .hit { position: absolute; top: 0; bottom: 0; border: 2px solid var(--accent);
+              background: rgba(31,111,235,.08); display: none; }
+  #tip dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 8px 0 0; font-size: 13px; }
+  #tip dt { color: var(--muted); }
+  #tip dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  #tip-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  #tip-actions button { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+                        border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  #tip-actions button:hover { border-color: var(--ink); }
+  #tip-actions button:disabled { opacity: .5; cursor: wait; }
+  .row.marked { background: #ececea; border-bottom: 2px solid #b9b9b2; }
+  .row.marked .label { background: #ececea; }
+  .row.marked img.spec { opacity: .75; }
+  .label .members { white-space: normal; line-height: 1.6; }
+  .label button { font: inherit; font-size: 11px; line-height: 1.2; padding: 1px 5px; cursor: pointer;
+                  border: 1px solid var(--line); border-radius: 3px; background: var(--panel); color: var(--ink); }
+  .label button:hover { border-color: var(--ink); }
+  .label .merge { align-self: flex-start; margin-top: 3px; }
+  .label .unlink { padding: 0 4px; margin-right: 2px; }
+  #status { padding: 24px 16px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Dolphin motif browser</h1>
+  <label>Linkage <select id="linkage"></select></label>
+  <div id="types"></div>
+  <span id="summary"></span>
+  <button id="reset" title="remove all merges and all noise / wrongly assigned marks">Reset</button>
+</header>
+<main id="rows"><div id="status">Loading…</div></main>
+<div id="tip">
+  <div class="frame"><img id="tip-img" alt=""><div class="hit" id="tip-hit"></div></div>
+  <dl id="tip-info"></dl>
+  <div id="tip-actions"></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let imageBase, models, byModel, byId, dist, N, types, parent;
+
+async function getJSON(path) {
+  const res = await fetch(path, { cache: "no-cache" });  // always revalidate: data changes with the DB
+  if (!res.ok) throw new Error(`${path}: ${res.status}`);
+  return res.json();
+}
+
+async function init() {
+  const [config, items, link, merges, settings] = await Promise.all(
+    ["/api/config", "/api/display_set", "/api/linkages", "/api/merges", "/api/settings"].map(getJSON));
+  parent = new Map(merges);
+  imageBase = config.imageBase.replace(/\/$/, "");
+
+  byId = new Map(items.map((r) => [r.results_id, r]));
+  byModel = new Map();
+  for (const r of items) {  // already sorted by mean_llr_score desc per submodel
+    if (!byModel.has(r.submodel_id)) byModel.set(r.submodel_id, []);
+    byModel.get(r.submodel_id).push(r);
+  }
+  models = [...byModel.keys()].sort((a, b) => a - b);
+  N = models.length;
+  const index = new Map(models.map((m, i) => [m, i]));
+
+  // one dense symmetric N x N matrix per linkage
+  dist = {};
+  for (const name of config.linkages) dist[name] = new Float64Array(N * N);
+  for (const row of link.rows) {
+    const i = index.get(row[0]), j = index.get(row[1]);
+    if (i === undefined || j === undefined) continue;
+    config.linkages.forEach((name, c) => { dist[name][i * N + j] = dist[name][j * N + i] = row[c + 2]; });
+  }
+
+  $("linkage").innerHTML = config.linkages.map((n) => `<option>${n}</option>`).join("");
+  $("linkage").value = config.linkages.includes("average") ? "average" : config.linkages[0];
+
+  // Per type: show checkbox, min mean_llr_score, min classification_confidence.
+  // Slider ranges come from that type's own hits. Values come from D1's type_settings
+  // (a type without a row starts unfiltered) and every change is saved back there.
+  types = [...new Set(items.map((r) => r.classification))].sort();
+  const saved = new Map(settings.map((s) => [s.classification, s]));
+  const slider = (t, key, label, value, digits) => {
+    const v = items.filter((r) => r.classification === t).map((r) => r[key]);
+    const lo = Math.min(...v), hi = Math.max(...v), val = value ?? lo;
+    return `<label>${label} ≥ <input type="range" data-type="${t}" ` +
+           `data-key="${key}" data-digits="${digits}" min="${lo}" max="${hi}" step="${(hi - lo) / 200 || 1}" ` +
+           `value="${val}"><output>${val.toFixed(digits)}</output></label>`;
+  };
+  $("types").innerHTML = types.map((t) => {
+    const s = saved.get(t);
+    return `<label class="type t-${t}"><input type="checkbox" value="${t}" ${!s || s.enabled ? "checked" : ""}>` +
+      `<span class="chip"></span>${t}</label>` +
+      slider(t, "mean_llr_score", "llr", s?.min_llr, 1) +
+      slider(t, "classification_confidence", "conf", s?.min_conf, 2);
+  }).join("");
+  $("types").addEventListener("input", (e) => {
+    if (e.target.type === "range") e.target.nextElementSibling.textContent = (+e.target.value).toFixed(+e.target.dataset.digits);
+  });
+  $("types").addEventListener("change", (e) => {
+    const t = e.target.dataset.type ?? e.target.value, q = (sel) => $("types").querySelector(sel);
+    fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        classification: t,
+        enabled: q(`input[type=checkbox][value="${t}"]`).checked,
+        min_llr: +q(`input[data-type="${t}"][data-key="mean_llr_score"]`).value,
+        min_conf: +q(`input[data-type="${t}"][data-key="classification_confidence"]`).value,
+      }),
+    }).then((res) => { if (!res.ok) alert(`Saving settings failed: ${res.status}`); });
+    render();
+  });
+  $("linkage").addEventListener("change", render);
+  render();
+}
+
+// Greedy seriation: start with the closest pair, then repeatedly append the
+// unplaced cluster nearest to the last placed one.
+function seriate(nodes, D, n) {
+  if (nodes.length < 3) return nodes;
+  let a = nodes[0], b = nodes[1], best = Infinity;
+  for (let x = 0; x < nodes.length; x++)
+    for (let y = x + 1; y < nodes.length; y++) {
+      const d = D[nodes[x] * n + nodes[y]];
+      if (d < best) { best = d; a = nodes[x]; b = nodes[y]; }
+    }
+  const order = [a, b];
+  const left = new Set(nodes); left.delete(a); left.delete(b);
+  while (left.size) {
+    const last = order[order.length - 1];
+    let next, nd = Infinity;
+    for (const c of left) if (D[last * n + c] < nd) { nd = D[last * n + c]; next = c; }
+    order.push(next); left.delete(next);
+  }
+  return order;
+}
+
+// "mean ± sd" (population sd) of a field over hits.
+function meanSd(hits, key, digits) {
+  const v = hits.map((r) => r[key]), m = v.reduce((a, b) => a + b, 0) / v.length;
+  const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length);
+  return `${m.toFixed(digits)} ± ${sd.toFixed(digits)}`;
+}
+
+// Most frequent type among hits, ties broken by type order; returns [type, count].
+function majority(hits) {
+  const counts = new Map();
+  for (const r of hits) counts.set(r.classification, (counts.get(r.classification) || 0) + 1);
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+}
+
+// Merged submodels (submodel_merges union-find) -> [[root, [member submodel indices]], ...]
+const rootOf = (m) => { while (parent.has(m)) m = parent.get(m); return m; };
+
+function groupsOf() {
+  const groups = new Map();
+  models.forEach((m, i) => {
+    const r = rootOf(m);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(i);
+  });
+  return [...groups];
+}
+
+// Group x group linkage from the submodel linkages: single = min, complete = max
+// (both exact); average = hit-count-weighted mean (exact for average linkage);
+// medoid = the same weighted mean (an approximation: groups have no medoid).
+function groupDist(groups, name) {
+  const D = dist[name], G = groups.length, out = new Float64Array(G * G);
+  const n = models.map((m) => byModel.get(m).length);
+  for (let a = 0; a < G; a++)
+    for (let b = a + 1; b < G; b++) {
+      let v = name === "single" ? Infinity : name === "complete" ? -Infinity : 0, w = 0;
+      for (const i of groups[a][1])
+        for (const j of groups[b][1]) {
+          const d = D[i * N + j];
+          if (name === "single") v = Math.min(v, d);
+          else if (name === "complete") v = Math.max(v, d);
+          else { v += d * n[i] * n[j]; w += n[i] * n[j]; }
+        }
+      out[a * G + b] = out[b * G + a] = w ? v / w : v;
+    }
+  return out;
+}
+
+function render() {
+  closeTip();
+  const on = new Set([...$("types").querySelectorAll("input:checked")].map((c) => c.value));
+  const min = {};  // min[type][key] from the per-type sliders
+  for (const el of $("types").querySelectorAll("input[type=range]"))
+    (min[el.dataset.type] ??= {})[el.dataset.key] = +el.value;
+  const keep = (r) => on.has(r.classification) && r.mean_llr_score >= min[r.classification].mean_llr_score &&
+                      r.classification_confidence >= min[r.classification].classification_confidence;
+  const groups = groupsOf(), G = groups.length, D = groupDist(groups, $("linkage").value);
+  const shown = new Map();
+  groups.forEach(([, members], g) => {
+    const kept = members.flatMap((i) => byModel.get(models[i]))
+      .filter((r) => !r.mark && keep(r))
+      .sort((a, b) => b.mean_llr_score - a.mean_llr_score);
+    if (kept.length) shown.set(g, kept);
+  });
+  const order = seriate([...shown.keys()], D, G);
+
+  const frag = document.createDocumentFragment();
+  const addRow = (cls, label, hits) => {
+    const row = document.createElement("div");
+    row.className = cls;
+    row.innerHTML = `<div class="label">${label}</div>` + hits.map(hitHTML).join("");
+    frag.appendChild(row);
+  };
+  // Collections on top: every marked hit, whatever the filters, so marks can always be undone.
+  const marked = {};
+  for (const [mark, title] of Object.entries(MARK_TITLES)) {
+    marked[mark] = [...byId.values()].filter((r) => r.mark === mark)
+      .sort((a, b) => a.submodel_id - b.submodel_id || b.mean_llr_score - a.mean_llr_score);
+    if (marked[mark].length)
+      addRow("row marked", `<b>${title}</b><span>${marked[mark].length} hits · click to restore</span>`, marked[mark]);
+  }
+  order.forEach((g, k) => {
+    const hits = shown.get(g), [root, members] = groups[g];
+    const step = k ? `d = ${D[order[k - 1] * G + g].toFixed(2)}` : "start";
+    const [maj, n] = majority(hits);
+    const name = members.length === 1 ? `<b>submodel ${root}</b>`
+      : `<b>group of ${members.length}</b><span class="members">` +
+        members.map((i) => `${models[i]}<button class="unlink" data-unlink="${models[i]}" ` +
+                           `title="unlink submodel ${models[i]} from this group">×</button>`).join(" ") + `</span>`;
+    const merge = k ? `<button class="merge" data-child="${root}" data-parent="${groups[order[k - 1]][0]}" ` +
+                      `title="merge this row into the row above">↑ merge</button>` : "";
+    addRow("row", name +
+      `<span class="maj t-${maj}"><span class="chip"></span>${maj} ${n}/${hits.length}</span>` +
+      `<span>${hits.length} hits · ${step}</span>` +
+      `<span>llr ${meanSd(hits, "mean_llr_score", 1)}</span>` +
+      `<span>conf ${meanSd(hits, "classification_confidence", 2)}</span>` + merge, hits);
+  });
+  $("rows").replaceChildren(frag);
+  const hits = [...shown.values()].reduce((s, v) => s + v.length, 0);
+  $("summary").innerHTML = `<b>${order.length}</b> / ${G} rows left · ${hits} / ${byId.size} hits · ${marked.noise.length} noise · ${marked.wrong.length} wrongly assigned` +
+    (G < N ? ` · ${N} submodels merged into ${G}` : "");
+}
+
+function hitHTML(r) {
+  const w = Math.round(Math.min(240, Math.max(24, (r.stop_time_s - r.start_time_s) * 60)));
+  return `<span class="hit t-${r.classification}"><img class="spec" loading="lazy" decoding="async" ` +
+         `data-id="${r.results_id}" style="width:${w}px" src="${imageBase}/spectrograms/${r.results_id}.png" ` +
+         `alt="${r.classification}"><span class="badge">${r.classification[0]}</span></span>`;
+}
+
+// Merge / unlink submodels in D1, then reload the union-find and redraw.
+async function editMerges(body) {
+  const res = await fetch("/api/merges", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!res.ok) { alert(`Saving failed: ${res.status}`); return; }
+  parent = new Map(await getJSON("/api/merges"));
+  render();
+}
+
+$("rows").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  b.disabled = true;
+  if (b.dataset.unlink) editMerges({ op: "unlink", node: +b.dataset.unlink });
+  else editMerges({ op: "merge", child: +b.dataset.child, parent: +b.dataset.parent });
+});
+
+const MARK_TITLES = { noise: "noise", wrong: "wrongly assigned" };
+
+$("reset").addEventListener("click", async () => {
+  const marks = [...byId.values()].filter((r) => r.mark).length;
+  if (!confirm(`Remove all ${parent.size} merges and all ${marks} noise / wrongly assigned marks? ` +
+               `This changes the shared database and cannot be undone.`)) return;
+  const res = await fetch("/api/reset", { method: "POST" });
+  if (!res.ok) { alert(`Reset failed: ${res.status}`); return; }
+  parent = new Map();
+  for (const r of byId.values()) r.mark = null;
+  render();
+});
+
+// Mark hits ("noise" / "wrong") or restore them (null) in D1, then redraw.
+async function setMark(ids, mark) {
+  const res = await fetch("/api/marks", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids, mark }),
+  });
+  if (!res.ok) { alert(`Saving failed: ${res.status}`); return; }
+  for (const id of ids) byId.get(id).mark = mark;
+  render();
+}
+
+// ---- click: region spectrogram + metadata
+const tip = $("tip"), tipImg = $("tip-img"), tipHit = $("tip-hit");
+let selected = null;  // the clicked spectrogram
+
+function placeHit() {
+  // The hit image is a column slice of the region image, so its pixel width is
+  // the hit's width in region pixels; region_offset_s / duration scales it to the left edge.
+  const r = byId.get(+selected.dataset.id), hitW = selected.naturalWidth, regW = tipImg.naturalWidth;
+  if (!hitW || !regW) return;
+  const left = (r.region_offset_s / (r.stop_time_s - r.start_time_s)) * hitW;
+  Object.assign(tipHit.style, { display: "block", left: `${100 * left / regW}%`, width: `${100 * hitW / regW}%` });
+}
+
+function position(e) {
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = e.clientX + pad, y = e.clientY + pad;
+  if (x + w > innerWidth - 8) x = Math.max(8, e.clientX - pad - w);
+  if (y + h > innerHeight - 8) y = Math.max(8, e.clientY - pad - h);
+  tip.style.left = `${x}px`; tip.style.top = `${y}px`;
+}
+
+function closeTip() {
+  if (selected) selected.classList.remove("selected");
+  selected = null; tip.style.display = "none"; tipImg.removeAttribute("src");
+}
+
+// Click a spectrogram to open its region, click it again / anywhere else / Esc to close.
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeTip(); });
+document.addEventListener("click", (e) => {
+  if (tip.contains(e.target)) return;
+  if (!e.target.matches("img.spec") || e.target === selected) { closeTip(); return; }
+  closeTip();
+  selected = e.target;
+  selected.classList.add("selected");
+  const r = byId.get(+selected.dataset.id);
+  tipHit.style.display = "none";
+  tipImg.onload = () => { placeHit(); position(e); };
+  tipImg.src = `${imageBase}/region_spectrograms/${r.results_id}.png`;
+  $("tip-info").innerHTML = [
+    ["submodel", r.submodel_id],
+    ["type", r.classification],
+    ["start time", `${r.start_time_s.toFixed(3)} s`],
+    ["stop time", `${r.stop_time_s.toFixed(3)} s`],
+    ["classification confidence", r.classification_confidence.toFixed(3)],
+    ["mean_llr_score", r.mean_llr_score.toFixed(3)],
+    ["wav file", r.wav_file],
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+
+  // Whole-cluster actions cover every submodel merged with this hit's submodel,
+  // and all their hits, not only those the filters show.
+  const root = rootOf(r.submodel_id), id = [r.results_id];
+  const members = models.filter((m) => rootOf(m) === root);
+  const group = members.flatMap((m) => byModel.get(m));
+  const what = members.length > 1 ? `merged group (${members.join(", ")})` : `submodel ${r.submodel_id}`;
+  const unmarked = group.filter((x) => !x.mark).map((x) => x.results_id);
+  const actions = r.mark
+    ? [["Restore hit", id, null],
+       r.mark === "noise" ? ["Not this cluster instead", id, "wrong"] : ["Noise instead", id, "noise"],
+       [`Restore all ${MARK_TITLES[r.mark]} of ${what}`,
+        group.filter((x) => x.mark === r.mark).map((x) => x.results_id), null]]
+    : [["Mark hit as noise", id, "noise"],
+       ["Not this cluster", id, "wrong"],
+       [`Mark ${what} as noise (${unmarked.length} hits)`, unmarked, "noise"]];
+  $("tip-actions").replaceChildren(...actions.map(([text, ids, mark]) => {
+    const b = document.createElement("button");
+    b.textContent = text;
+    b.onclick = () => { $("tip-actions").querySelectorAll("button").forEach((x) => { x.disabled = true; }); setMark(ids, mark); };
+    return b;
+  }));
+  tip.style.display = "block";
+  position(e);
+});
+
+init().catch((err) => { $("status").textContent = `Failed to load: ${err.message}`; });
+</script>
+</body>
+</html>

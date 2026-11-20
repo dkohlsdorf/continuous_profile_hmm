@@ -10,9 +10,11 @@ The display set keeps, per submodel, the N_INSTANCES hits with the highest
 mean_llr_score among those classified with confidence > TH_CLASS; submodels
 with fewer than 5 such hits are dropped. It is written to DISPLAY_CSV.
 
-If --run-folder is given, files land in OUT_DIR/<subfolder>/<results_id>.<ext>;
-files already on disk are skipped, so the script can be rerun after an
-interruption. Auth: see gdrive_helper.py.
+If --run-folder is given, RESULTS_CSV is first downloaded from that run's
+webui_preprocessing/results.csv on Drive, and after building the display set
+its files land in OUT_DIR/<subfolder>/<results_id>.<ext>; files already on
+disk are skipped, so the script can be rerun after an interruption.
+Auth: see gdrive_helper.py.
 """
 
 import argparse
@@ -50,9 +52,7 @@ def fetch(job):
     tmp.rename(path)
 
 
-def download_display_set(run_folder, ids, out_dir, workers):
-    service = get_drive_service()
-    out_id = find_child(service, run_folder, OUTPUT_FOLDER_NAME)
+def download_display_set(service, out_id, ids, out_dir, workers):
     jobs = []
     for name in SUBFOLDERS:
         (out_dir / name).mkdir(parents=True, exist_ok=True)
@@ -72,17 +72,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", type=Path, default=DATA_DIR / "results.csv")
     parser.add_argument("--display", type=Path, default=DATA_DIR / "results_display_set.csv")
-    parser.add_argument("--run-folder", help="Drive id of the motif_extend_find_<timestamp> folder; omit to skip download")
+    parser.add_argument("--run-folder", help="Drive id of the motif_extend_find_<timestamp> folder; "
+                                             "omit to use the local RESULTS_CSV and skip downloads")
     parser.add_argument("--out-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--workers", type=int, default=16)
     args = parser.parse_args()
+
+    if args.run_folder:
+        service = get_drive_service()
+        out_id = find_child(service, args.run_folder, OUTPUT_FOLDER_NAME)
+        download(service, find_child(service, out_id, "results.csv"), args.results)
+        print(f"downloaded results.csv -> {args.results}")
 
     df = make_display_set(pd.read_csv(args.results))
     df.to_csv(args.display, index=False)
     print(f"{len(df)} hits from {df['submodel_id'].nunique()} submodels -> {args.display}")
 
     if args.run_folder:
-        download_display_set(args.run_folder, set(df["results_id"].astype(str)), args.out_dir, args.workers)
+        download_display_set(service, out_id, set(df["results_id"].astype(str)), args.out_dir, args.workers)
 
 
 if __name__ == "__main__":
