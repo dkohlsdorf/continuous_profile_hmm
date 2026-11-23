@@ -15,6 +15,7 @@ webui/
   prepdb.py                 4. build web.db (SQLite)
   gdrive_helper.py          Google Drive helpers shared by 1 and 2
   app/                      the Cloudflare Worker + page
+  app/scripts/deploy.sh     deploy to Cloudflare (D1 + R2 + Worker)
 ```
 
 ## 1. Data preparation
@@ -125,16 +126,71 @@ npx wrangler d1 execute DB --local --command "SELECT * FROM submodel_merges" --j
 
 ## 3. Deploy to Cloudflare
 
-1. `npx wrangler login`
-2. `npx wrangler d1 create dolphin-web` and put the printed `database_id`
-   into `app/wrangler.jsonc`.
-3. `npm run db:remote`. Loading ~150k linkage rows is more than the free tier's
-   100k writes per day, so it needs the $5/month Workers plan or two days.
-4. Create an R2 bucket, upload `DATA_DIR/spectrograms/` and
-   `DATA_DIR/region_spectrograms/` with the same folder names (for example
-   with `rclone copy`), make the bucket public, and set its URL as
-   `IMAGE_BASE_URL` in `app/wrangler.jsonc`.
-5. `npm run deploy`
+`app/scripts/deploy.sh` creates the D1 database and the R2 bucket, loads the
+data, uploads the spectrograms and deploys the Worker. Only the login and the
+Access setup are manual.
 
-The edit endpoints have no login. Put the deployed site behind Cloudflare
-Access (free for up to 50 users) before sharing the URL.
+### Once
+
+```sh
+cd webui/app
+npx wrangler login
+brew install rclone
+```
+
+Create an R2 API token for the image upload (dashboard: **R2 → Manage API
+tokens**, permission *Object Read & Write*) and export it with your account id:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=...  R2_ACCESS_KEY_ID=...  R2_SECRET_ACCESS_KEY=...
+```
+
+### Deploy
+
+```sh
+webui/app/scripts/deploy.sh               # db + images + app
+webui/app/scripts/deploy.sh app           # after code changes
+webui/app/scripts/deploy.sh db images     # after a new data run
+```
+
+| step | what it does |
+|---|---|
+| `db` | creates the D1 database `dolphin-web` if missing, writes its id into `app/wrangler.jsonc`, loads `DATA_DIR/web.db` (`npm run db:remote`) |
+| `images` | creates the R2 bucket `dolphin-web-images` if missing, enables its public r2.dev URL, writes it into `app/wrangler.jsonc` as `IMAGE_BASE_URL`, uploads `spectrograms/` and `region_spectrograms/` with rclone (~4.8 GB; files already uploaded are skipped) |
+| `app` | `wrangler deploy`; prints the URL `https://dolphin-web.<subdomain>.workers.dev` |
+
+Every step can be rerun. Env: `DATA_DIR`, `DB_NAME` (default `dolphin-web`),
+`BUCKET` (default `dolphin-web-images`).
+
+- `db` rewrites all ~150k linkage rows on every run. That is more than the
+  free tier's 100k D1 writes per day, so it needs the $5/month Workers plan or
+  two days. Don't run it for code-only changes.
+- `db` writes the real `database_id` into `app/wrangler.jsonc`, which is
+  tracked in git. That id is not a secret, but check the diff before committing.
+- Export the edits from the deployed app with the commands in section 2,
+  using `--remote` instead of `--local`.
+
+### Restrict access (Cloudflare Access)
+
+The edit endpoints (`/api/marks`, `/api/merges`, `/api/reset`) have no login:
+anyone with the URL can change or wipe the edits. Before sharing the URL:
+
+1. **Workers & Pages → dolphin-web → Settings → Domains & Routes**, and next to
+   `workers.dev` click **Enable Cloudflare Access**. The first time, this asks
+   you to set up Zero Trust: pick a team name and the **Free** plan (up to 50
+   users; it may ask for a payment method).
+2. **Manage Cloudflare Access** opens the generated application. Edit its
+   policy: action **Allow**, include **Emails** (list of addresses) or
+   **Emails ending in** (`@yourlab.org`).
+3. Open the URL in a private window: you get a Cloudflare login that emails a
+   one-time code, and only the listed addresses get in.
+
+Add or remove people by editing the policy; no redeploy needed. With a custom
+domain or no toggle, create it by hand instead: **Zero Trust → Access →
+Applications → Add → Self-hosted**, domain `dolphin-web.<subdomain>.workers.dev`
+with an empty path, and the same policy.
+
+The r2.dev image URL is not covered by Access: the spectrograms stay publicly
+readable to anyone who knows a file name. Only the data and the edit endpoints
+are protected. To protect the images too, give the bucket a custom domain on a
+zone you own and add a second Access application for it.
