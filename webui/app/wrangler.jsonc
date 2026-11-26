@@ -1,21 +1,34 @@
 {
-  "name": "dolphin-web",
-  "main": "src/worker.js",
-  "compatibility_date": "2026-11-01",
-  "assets": { "directory": "public" },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "dolphin-web",
-      // local dev works with any id; for deploy replace with the id printed by
-      // `npx wrangler d1 create dolphin-web`
-      "database_id": "00000000-0000-0000-0000-000000000000"
-    }
-  ],
-  "vars": {
-    // where /spectrograms/<id>.png and /region_spectrograms/<id>.png live:
-    // the public URL of the R2 bucket in production; .dev.vars points local
-    // dev at `npm run images` instead
-    "IMAGE_BASE_URL": "https://REPLACE-WITH-R2-PUBLIC-URL"
-  }
+	"name": "dolphin-web",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-11-01",
+	"assets": {
+		"directory": "public"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "dolphin-web",
+			// local dev works with any id; for deploy replace with the id printed by
+			// `npx wrangler d1 create dolphin-web`
+			"database_id": "d4d73793-6683-4025-a390-1caebd5ffe48"
+		},
+		{
+			"binding": "dolphin_web",
+			"database_name": "dolphin-web",
+			"database_id": "d4d73793-6683-4025-a390-1caebd5ffe48"
+		}
+	],
+	"vars": {
+		// where /spectrograms/<id>.png and /region_spectrograms/<id>.png live:
+		// the public URL of the R2 bucket in production; .dev.vars points local
+		// dev at `npm run images` instead
+		"IMAGE_BASE_URL": "https://pub-eef7048550854e15bd15bf2eef5b11bf.r2.dev"
+	},
+	"r2_buckets": [
+		{
+			"bucket_name": "dolphin-web-images",
+			"binding": "dolphin_web_images"
+		}
+	]
 }
